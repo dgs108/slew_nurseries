@@ -1,0 +1,1683 @@
+---
+title: "United States Scalloped Hammerhead Nurseries, Relatedness"
+output: 
+  html_notebook: 
+    highlight: kate
+    theme: flatly
+    toc: yes
+  html_document: 
+    toc: yes
+---
+
+# Environment
+
+```{r Load packages/functions, message=FALSE, warning=FALSE}
+
+.libPaths("/usr/lib64/R/library")
+
+# invalidate cache when the package version changes
+
+knitr::opts_chunk$set(
+  root.dir = "~/projects/hammerheads/nurseries",
+	message = FALSE,
+	warning = FALSE,
+  cache.extra = packageVersion("tint"),
+	tidy = FALSE,
+	echo = FALSE)
+
+options(htmltools.dir.version = FALSE)
+
+# conflicts
+
+library(conflicted)
+conflict_prefer("count", "dplyr")
+conflict_prefer("arrange", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("summarise", "dplyr")
+conflict_prefer("summarize", "dplyr")
+conflict_prefer("s.label", "adegraphics")
+conflict_prefer("s.value", "adegraphics")
+conflict_prefer("scalebar", "raster")
+conflict_prefer("rename", "dplyr")
+
+# packages
+
+library(tidyverse)
+library(patchwork)
+library(here)
+library(readxl)
+library(writexl)
+library(broom)
+library(glue)
+library(related)
+library(clock)
+library(lubridate)
+library(zvau)
+library(poppr)
+library(CKMRsim)
+library(purrr)
+library(ggraph)
+library(igraph)
+library(haplotypes)
+library(reshape2)
+library(ape)
+library(pegas)
+
+# source functions
+
+source("~/bin/genind.R")
+source("~/bin/PCA.R")
+source("~/bin/ggplot.R")
+
+nursery_order <- c("BB", "TR", "CB", "FPH", "CCB")
+
+nursery_order_full <- c("Bulls Bay", "Tolomato River", "Cape Canaveral", "Florida Panhandle", "Corpus Christi Bay")
+
+nursery_map <- rlang::set_names(nursery_order_full, nursery_order)
+
+nursery_colors <- c('#a50026', '#f46d43', '#fee090', '#74add1', '#313695')
+
+```
+
+# TrioML
+
+Estimate point and CI relatedness values by pasting the code below into a terminal screen.
+
+```{r message=FALSE, warning=FALSE, echo = FALSE, eval = FALSE}
+
+# navgigate to `/home/dswift/projects/hammerheads/nurseries` and open R terminal in screen
+
+library(tidyverse)
+library(here)
+library(related)
+library(poppr)
+
+slew.gen <- read.genepop(file = here("data", "filter", "slew_nurseries_filt.gen"), ncode = 3L, quiet = FALSE) %>% 
+  missingno(., type = "loci", cutoff = 0)
+
+gen_df <- genind2df(slew.gen, usepop = FALSE, oneColPerAll = TRUE) %>%
+  rownames_to_column("seq_id") %>% 
+  write_delim(., here("data", "related", "slew_related.input"), col_names = FALSE, delim = "\t")
+
+geno_data <- readgenotypedata(here("data", "related", "slew_related.input"))
+
+# point estimates
+
+related_results <- coancestry(geno_data$gdata, trioml = 1)
+
+related_point <- related_results$relatedness
+
+write_csv(related_point, here("data", "related", "slew_related_point.csv"))
+
+# point and ci estimates
+
+related_results <- coancestry(geno_data$gdata, trioml = 2)
+
+related_ci <- related_results$relatedness.ci95
+
+write_csv(related_ci, here("data", "related", "slew_related_ci.csv"))
+
+```
+
+Combine outputs.
+
+```{r, message=F}
+
+trioml_point <- read_csv(here("data", "related", "slew_related_point.csv")) %>% 
+  select("pair.no", "ind1.id", "ind2.id", "trioml")
+
+trioml_ci <- read_csv(here("data", "related", "slew_related_ci.csv")) %>% 
+  select("pair.no", "trioml.low", "trioml.high")
+
+trioml <- left_join(trioml_point, trioml_ci, by = "pair.no") %>% 
+  select("ind1.id", "ind2.id", "trioml.low", "trioml", "trioml.high") %>% 
+  write_csv(., here("data", "related", "trioml_output.csv"))
+
+```
+
+# CKMRSim
+
+## Prep Input Files
+
+```{r, message=F}
+
+slew.gen <- read.genepop(file = here("data", "filter", "slew_nurseries_filt.gen"), ncode = 3L, quiet = FALSE)
+
+slew_strata <- read_csv(here("data", "filter", "slew_nurseries_strata.csv")) %>% 
+  mutate(
+    Nursery = dplyr::recode(nursery, !!!nursery_map),
+    Nursery = factor(Nursery, levels = nursery_order_full)
+  )
+
+slew_strata <- indNames(slew.gen) %>% 
+  as_tibble_col("seq_id") %>% 
+  left_join(., slew_strata)
+
+strata(slew.gen) <- slew_strata
+
+setPop(slew.gen) <- ~nursery
+
+```
+
+Create a long genotypes df using the genind object.
+
+```{r, message = F}
+
+slew_no_miss.gen <- slew.gen %>% 
+  missingno(., type = "loci", cutoff = 0)
+
+long_geno <- genind2df(slew_no_miss.gen, oneColPerAll = TRUE) %>%
+    as_tibble() %>%
+    mutate(id = indNames(slew_no_miss.gen)) %>%
+    pivot_longer(-c("pop", "id"), names_to = "locus.gene_copy", values_to = "allele") %>%
+    extract(locus.gene_copy, c("locus", "gene_copy"), "(.*)\\.(.*)") %>%
+    select(Indiv = id, Locus = locus, gene_copy, Allele = allele) %>%
+    mutate(Allele = if_else(Allele == "NA", NA_character_, Allele))
+
+```
+
+Convert genind to CKMR object. 
+
+Any relationship you want to compare need to be included in the chunk below.
+
+This chunk includes all quantifiable relationships.
+
+```{r}
+
+genind2ckmr <- function(x, ge_mod_assumed, ge_mod_true, ge_mod_assumed_pars_list, ge_mod_true_pars_list) {
+
+  loci <- locNames(x)
+  
+  long_geno <- genind2df(x, oneColPerAll = TRUE) %>%
+    as_tibble() %>%
+    mutate(id = indNames(x)) %>%
+    pivot_longer(-c("pop", "id"), names_to = "locus.gene_copy", values_to = "allele") %>%
+    extract(locus.gene_copy, c("locus", "gene_copy"), "(.*)\\.(.*)") %>%
+    select(Indiv = id, Locus = locus, gene_copy, Allele = allele) %>%
+    mutate(Allele = if_else(Allele == "NA", NA_character_, Allele))
+  
+  alle_freqs <- long_geno %>%
+    count(Locus, Allele) %>%
+    group_by(Locus) %>%
+    mutate(Freq = n / sum(n),
+           Chrom = "Unk",
+           Pos = as.integer(factor(Locus, levels = loci))) %>%
+    ungroup() %>%
+    select(Chrom, Pos, Locus, Allele, Freq) %>%
+    arrange(Pos, desc(Freq)) %>%
+    mutate(AlleIdx = NA,
+           LocIdx = NA) %>%
+    filter(!is.na(Allele))
+  
+  afreqs_ready <- reindex_markers(alle_freqs)
+  
+  ckmr_obj <- create_ckmr(
+    D = afreqs_ready,
+    kappa_matrix = kappas[c("MZ", "PO", "FS", "HS", "GP", "AN", "DFC", "HAN", "FC", "HFC", "DHFC", "SC", "HSC", "U"), ],
+    ge_mod_assumed = ge_mod_assumed,
+    ge_mod_true = ge_mod_true,
+    ge_mod_assumed_pars_list = ge_mod_assumed_pars_list,
+    ge_mod_true_pars_list = ge_mod_true_pars_list
+  )
+  
+  return(ckmr_obj)
+
+}
+
+```
+
+Simulate genotype pairs and calculate their log-likelihoods.
+
+```{r}
+
+ckmr <- genind2ckmr(slew_no_miss.gen,
+                        ge_mod_assumed = ge_model_TGIE,
+                        ge_mod_true = ge_model_TGIE,
+                        ge_mod_assumed_pars_list = list(epsilon = 0.005),
+                        ge_mod_true_pars_list = list(epsilon = 0.005))
+
+some_relat <- c("PO", "FS", "HS", "FC", "U")
+
+qij <- simulate_Qij(ckmr,
+                    calc_relats = some_relat,
+                    sim_relats = some_relat,
+                    reps = 1e4)
+
+```
+
+Plot simulated log-likelihood ratios for a subset of relationship types.
+
+```{r fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+
+logls <- extract_logls(qij,
+                            numer = c(PO = 1),
+                            denom = c(U = 1)) %>%
+  mutate(markers = "slew_no_miss.gen") %>% 
+  filter(true_relat %in% some_relat) %>% 
+  mutate(true_relat = ordered(true_relat, levels = some_relat)) 
+
+logls %>%
+  ggplot(aes(x = logl_ratio, fill = true_relat)) +
+  geom_density(alpha = 0.25) +
+  theme_standard
+
+```
+
+## Assess Resolution
+
+The rule of thumb is the the FPR should be at least 10-100 times smaller than the reciprocal number of comparisons.
+
+```{r}
+
+n_inds <- nrow(slew_no_miss.gen$strata)
+
+fpr <- 0.1 * (n_inds * (n_inds / 2)) ^ (-1)
+
+```
+
+Let's find the logl ratio value that gives the largest FPR smaller than `fpr`.
+
+```{r}
+
+mc_sample_simple(qij, 
+                 nu = "FC",
+                 de = "U") %>% 
+  mutate(markers = "slew_no_miss.gen") %>%
+  filter(FPR < fpr) %>%
+  arrange(FPR)
+
+```
+
+Let's see how much overlap there is between parent-offspring (PO) and full siblings (FS).
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+po_fs_plot <- extract_logls(qij,
+              numer = c(PO = 1),
+              denom = c(FS = 1)) %>%
+  mutate(markers = "slew_no_miss.gen") %>% 
+  filter(true_relat %in% c("PO", "FS")) %>% 
+  mutate(true_relat = ordered(true_relat, levels = c("PO", "FS"))) %>% 
+  ggplot(aes(x = logl_ratio, fill = true_relat)) +
+  geom_density(alpha = 0.75) +
+  scale_fill_manual(values = c("#ff7f00", "#377eb8")) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+  theme_standard
+
+po_fs_plot
+
+```
+
+These two distributions do not overlap, so we are unlikely to confused PO and FS.
+
+What about full and half siblings?
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+fs_hs_plot <- extract_logls(qij,
+              numer = c(FS = 1),
+              denom = c(HS = 1)) %>%
+  mutate(markers = "slew_no_miss.gen") %>% 
+  filter(true_relat %in% c("FS", "HS")) %>% 
+  mutate(true_relat = ordered(true_relat, levels = c("FS", "HS"))) %>% 
+  ggplot(aes(x = logl_ratio, fill = true_relat)) +
+  geom_density(alpha = 0.75) +
+  scale_fill_manual(values = c("#377eb8", "#e41a1c")) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+  theme_standard
+
+fs_hs_plot
+
+```
+
+Same.
+
+What about half siblings, which we can compare to either half aunt/uncle-niece/nephew (HAN) or first cousins (FC)? Note: the distribution of log-likelihoods are exactly the same when comparing HS against HAN and FC.
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+hs_fc_plot <- extract_logls(qij,
+              numer = c(HS = 1),
+              denom = c(FC = 1)) %>%
+  mutate(markers = "slew_no_miss.gen") %>% 
+  filter(true_relat %in% c("HS", "FC")) %>% 
+  mutate(true_relat = ordered(true_relat, levels = c("HS", "FC"))) %>% 
+  ggplot(aes(x = logl_ratio, fill = true_relat)) +
+  geom_density(alpha = 0.75) +
+  scale_fill_manual(values = c("#e41a1c", "#4daf4a")) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+  theme_standard
+
+hs_fc_plot
+
+```
+
+Still very little overlap, but we will want to be conservative when calling HS because we are not accounting for the influence of linkage.
+
+When using the HS/FC log-likelihood ratio, we can see how many unrelated pairs might conceivably get in there. When the truth is unrelated, we can use importance sampling with a distribution of unlinked markers (because linkage does not affect the distribution of the log likelihoods in unrelated pairs), while using the linked simulations for calculating the FNR of the half-siblings.
+
+```{r}
+
+# false negative / positive rates given our threshold
+
+mc_sample_simple(
+  Q = qij,
+  Q_for_fnrs = qij,
+  nu = "HS",
+  de = "FC",
+  method = "IS"
+) %>% 
+  filter(FPR < fpr)
+
+```
+
+With a FNR of 0.01, FPR is 1.069893e-22.
+
+What about the likelihood of mistaking FC for HS? To do this, we don't have to do any importance sampling because there shouldn't be that many FC pairs relative to the number of unrelated pairs.
+
+```{r}
+
+mc_sample_simple(
+  Q = qij,
+  nu = "HS",
+  de = "FC",
+  tr = "FC",
+  method = "vanilla")
+
+```
+
+FPRs are zero for all FNRs shown.
+
+First, let's make sure there are no duplicates present. 
+
+```{r}
+
+find_close_matching_genotypes(LG = long_geno, CK = ckmr, max_mismatch = 200)
+
+```
+
+This means that all pairs of samples have mismatches at 200 loci or fewer, suggesting none are duplicated.
+
+Assess all of the different types of pairwise relationships together and compare results to simulations.
+
+```{r}
+
+pw_lrt <- lapply(X = list(
+  POU = c("PO", "U"),
+  POFS = c("PO", "FS"),
+  FSHS = c("FS", "HS"),
+  HSFC = c("HS", "FC")),
+  FUN = function(x) {
+    pairwise_kin_logl_ratios(
+      D1 = long_geno, 
+      D2 = long_geno, 
+      CK = ckmr,
+      numer = x[1],
+      denom = x[2],
+      num_cores = 20)
+  }) %>%
+  bind_rows(.id = "lr_type") %>%
+  pivot_wider(names_from = lr_type, values_from = logl_ratio) %>% 
+  write_csv(., here("data", "related", "slew_pw_lrt.csv"))
+
+```
+
+## Kin Pairs
+
+Combine with coancestry results and sample data.
+
+```{r, message=FALSE}
+
+# import strata and retain only variables most relevant to kin relationships
+
+kin_sample_data <- slew_strata <- read_csv(here("data", "filter", "slew_nurseries_strata.csv")) %>% 
+  select(
+    seq_id,
+    nursery,
+    sex,
+    date,
+    stage
+    )
+
+# import and rename ckmrsim twice to get make sure all pairs match
+
+pw_lrt <- read_csv(here("data", "related", "slew_pw_lrt.csv"))
+
+pw_lrt_1 <- pw_lrt %>% 
+  rename(seq_id1 = D2_indiv,
+         seq_id2 = D1_indiv)
+
+pw_lrt_2 <- pw_lrt %>% 
+  rename(seq_id1 = D1_indiv,
+         seq_id2 = D2_indiv)
+
+# join with trioml for each ckmrsim df and combine
+
+trioml <- read_csv(here("data", "related", "trioml_output.csv")) %>% 
+  rename(seq_id1 = ind1.id,
+         seq_id2 = ind2.id)
+
+all_pairs_1 <- left_join(trioml, pw_lrt_1, by = c("seq_id1", "seq_id2"))
+
+all_pairs_2 <- left_join(trioml, pw_lrt_2, by = c("seq_id1", "seq_id2"))
+
+# produce clean df with relevant sample data
+
+all_pairs <- rbind(all_pairs_1, all_pairs_2) %>% 
+  drop_na(num_loc) %>% 
+  select(num_loc,
+         seq_id1,
+         #trioml.low,
+         trioml,
+         #trioml.high,
+         POFS,
+         FSHS,
+         HSFC,
+         seq_id2
+         ) %>% 
+  left_join(kin_sample_data, by = c("seq_id1" = "seq_id")) %>% 
+  rename_with(
+    ~ paste0(.x, "1"),
+    .cols = any_of(setdiff(names(kin_sample_data), "seq_id"))
+    ) %>% 
+  left_join(kin_sample_data, by = c("seq_id2" = "seq_id")) %>%
+  rename_with(
+    ~ paste0(.x, "2"),
+    .cols = any_of(setdiff(names(kin_sample_data), "seq_id"))
+  ) %>% 
+  select(
+    num_loc,
+    seq_id1,
+    nursery1,
+    sex1,
+    date1,
+    stage1,
+    #trioml.low,
+    trioml,
+    #trioml.high,
+    POFS,
+    FSHS,
+    HSFC,
+    seq_id2,
+    nursery2,
+    sex2,
+    date2,
+    stage2
+    ) %>% 
+  arrange(desc(trioml)) %>% 
+  write_csv(., here("data", "related", "slew_nurseries_all_pairs_trioml_lrts.csv"))
+
+# clean up files
+
+rm(pw_lrt, trioml, pw_lrt_1, pw_lrt_2, all_pairs_1, all_pairs_2)
+
+```
+
+### PO Pairs
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+mc_sample_simple(
+  Q = qij,
+  nu = "PO",
+  de = "FS",
+  tr = "FS",
+  method = "vanilla")
+
+```
+
+Set `Lambda_star` > 30, plot distribution of TrioML vs log-likelihoods again, and find parent-offspring pairs.
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+po_pairs <- all_pairs %>%
+  arrange(desc(POFS)) %>%
+  filter(POFS > 30) %>% 
+  write_csv(., here("data", "related", "slew_po_logls.csv"))
+
+# plot again with observed PO pairs shown
+
+po_fs_plot +
+  geom_vline(xintercept = 30, color = "black", linetype = "dashed") +
+  geom_jitter(data = po_pairs, 
+              mapping = aes(x = POFS, y = 0.002), 
+              width = 0, height = 0.001, color = "black", fill = NA, shape = 21, show.legend = F)  +
+  ylab("density")
+
+```
+
+With `Lambda_star = 30`, FNR < 0.05 and FPR = 0.
+
+### FS Pairs
+
+Use `fs_hs_plot` made earlier to choose a log-likelihood cut-off to find full sibling pairs.
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+fs_hs_plot
+
+# plot TrioML vs FSHS
+
+all_pairs %>%
+  anti_join(po_pairs, by = c("seq_id1", "seq_id2")) %>% # remove PO pairs
+  ggplot(., aes(x = trioml, y = FSHS)) +
+  geom_point(shape = 1, show.legend = F) +
+  geom_vline(aes(xintercept = 0.5), color = "red", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(
+    "TrioML Relatedness Point Estimate",
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.1),
+    labels = seq(0, 1, 0.1)) +
+  labs(y = "FSHS Log-likelihoods") +
+  theme_standard
+
+# determine suitable logl cut-off
+
+mc_sample_simple(
+  Q = qij,
+  nu = "FS",
+  de = "HS",
+  tr = "HS",
+  method = "vanilla",
+  lambda = seq(20, 30, 1))
+
+```
+
+Set `Lambda_star` > 30, plot distribution of TrioML vs log-likelihoods again, and find full sib pairs.
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+all_pairs %>%
+  anti_join(po_pairs, by = c("seq_id1", "seq_id2")) %>% # remove PO pairs
+  ggplot(., aes(x = trioml, y = FSHS)) +
+  geom_point(shape = 1, show.legend = F) +
+  geom_hline(aes(yintercept = 30), color = "red", linetype = "dotted", linewidth = 1) +
+  geom_vline(aes(xintercept = 0.5), color = "red", linetype = "dotted", linewidth = 1) +
+  scale_x_continuous(
+    "TrioML Point Estimate",
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.1),
+    labels = seq(0, 1, 0.1)) +
+  labs(y = "FSHS Log-likelihoods") +
+  theme_standard
+
+ggsave(here("data", "related", "slew_fs_hs_trioml_logl.png"))
+
+# find FS pairs
+
+fs_pairs <- all_pairs %>%
+  anti_join(po_pairs, by = c("seq_id1", "seq_id2")) %>% 
+  arrange(desc(FSHS)) %>%
+  filter(FSHS > 30) %>% 
+  mutate(type = "fs") %>% 
+  write_csv(., here("data", "related", "slew_nurseries_fs_logls.csv"))
+
+# plot again with observed PO pairs shown
+
+fs_hs_plot +
+  geom_vline(xintercept = 30, color = "black", linetype = "dashed") +
+  geom_jitter(data = fs_pairs, 
+              mapping = aes(x = FSHS, y = 0.002), 
+              width = 0, height = 0.001, color = "black", fill = NA, shape = 21, show.legend = F)  +
+  ylab("density")
+
+```
+
+### HS Pairs
+
+Use `hs_fc_plot` made earlier to choose a log-likelihood cut-off to find half sibling pairs.
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+hs_fc_plot
+
+# plot TrioML vs FSHS
+
+all_pairs %>%
+  anti_join(bind_rows(po_pairs, fs_pairs), by = c("seq_id1", "seq_id2")) %>%  # remove PO and FS pairs 
+  ggplot(., aes(x = trioml, y = HSFC)) +
+  geom_point(shape = 1, show.legend = F) +
+  geom_vline(aes(xintercept = 0.25), color = "red", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(
+    "TrioML Relatedness Point Estimate",
+    limits = c(0, 0.5),
+    breaks = seq(0, 0.5, 0.1),
+    labels = seq(0, 0.5, 0.1)) +
+  labs(y = "HSFC Log-likelihoods") +
+  theme_standard
+
+# determine suitable logl cut-off
+
+mc_sample_simple(
+  Q = qij,
+  nu = "HS",
+  de = "FC",
+  tr = "FC",
+  method = "vanilla",
+  lambda = seq(0, 10, 1))
+
+```
+
+Set `Lambda_star` threshold, plot distribution of TrioML vs log-likelihoods again, and find half sib pairs.
+
+```{r fig.height=5, fig.width=5, message=FALSE}
+
+all_pairs %>%
+  anti_join(bind_rows(po_pairs, fs_pairs), by = c("seq_id1", "seq_id2")) %>%  # remove PO and FS pairs 
+  ggplot(., aes(x = trioml, y = HSFC)) +
+  geom_point(shape = 1, show.legend = F) +
+  geom_hline(aes(yintercept = 8), color = "red", linetype = "dotted", linewidth = 1) +
+  geom_vline(aes(xintercept = 0.25), color = "red", linetype = "dotted", linewidth = 1) +
+  scale_x_continuous(
+    "TrioML Point Estimate",
+    limits = c(0, 0.35),
+    breaks = seq(0, 0.35, 0.05),
+    labels = seq(0, 0.35, 0.05)) +
+  labs(y = "HSFC Log-likelihoods") +
+  theme_standard
+
+ggsave(here("data", "related", "slew_hs_fc_trioml_logl.png"))
+
+# find HS pairs
+
+hs_pairs <- all_pairs %>%
+  anti_join(bind_rows(po_pairs, fs_pairs), by = c("seq_id1", "seq_id2")) %>%  # remove PO and FS pairs 
+  arrange(desc(HSFC)) %>%
+  filter(HSFC > 8) %>% 
+  mutate(type = "hs") %>% 
+  write_csv(., here("data", "related", "slew_nurseries_hs_logls.csv"))
+
+```
+
+# Combine
+
+Combine inferred full sib and half sib pairs.
+
+```{r, message=F}
+
+sib_pairs <- rbind(fs_pairs, hs_pairs) %>% 
+  mutate(days_diff = abs(as.numeric(date1 - date2))) %>% 
+  select(
+    seq_id1,
+    nursery1,
+    stage1,
+    date1,
+    sex1,
+    type,
+    trioml,
+    days_diff,
+    seq_id2,
+    nursery2,
+    stage2,
+    date2,
+    sex2
+  ) %>% 
+  write_csv(., here("data", "related", "slew_nurseries_sibs.csv"))
+
+```
+
+# mtWGS
+
+## Assess Raw Reads
+
+Assess number of reads per sample and remove duplicates.
+
+```{r, message = FALSE, fig.height=5, fig.width=5}
+
+genewiz_output <- read_xlsx(here("data", "mtWGS", "slew_mtWGS_genewiz_output.xlsx"))
+
+# plots
+
+## reads
+
+ggplot(genewiz_output, aes(x = reads)) +
+  geom_histogram(binwidth = 5e5, color = "black", fill = "grey") +
+  #geom_vline(aes(xintercept = mean(reads, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 5e6, color = "red", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous("Reads", limits = c(0, 7e7), breaks = c(seq(0, 7e7, 1e7)), labels = c(seq(0, 7e7, 1e7))) +
+  theme_standard
+
+ggsave(here("data", "mtWGS", "slew_mtWGS_reads.png"))
+
+## % bases > 30
+
+ggplot(genewiz_output, aes(x = `%_bases_>30`)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+  #geom_vline(aes(xintercept = mean(reads, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+ # geom_vline(xintercept = 5e6, color = "red", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous("Reads", limits = c(0, 100), breaks = c(seq(0, 100, 10)), labels = c(seq(0, 100, 10))) +
+  theme_standard
+
+ggsave(here("data", "mtWGS", "slew_mtWGS_reads_quality.png"))
+
+```
+
+Run `fastqc` and `multiqc`.
+
+```{bash, eval = F}
+
+#!/bin/bash
+#SBATCH -J fastqc
+#SBATCH -o fastqc.out
+#SBATCH -e fastqc.err
+#SBATCH -N 1
+#SBATCH -n 64
+#SBATCH -p normal
+#SBATCH --mail-user=dominic.swift@tamucc.edu
+#SBATCH --mail-type=begin                    # email me when the job starts
+#SBATCH --mail-type=end                      # email me when the job ends
+#SBATCH --time=96:00:00
+
+source /home/dswift/.bashrc
+conda activate fastqc
+
+# run fastqc on each file and combine results with multiqc
+
+fastqc -t 64 *fastq.gz
+
+multiqc *fastqc.zip
+
+```
+
+Assess fastqc outputs.
+
+```{r, message = FALSE, fig.height=5, fig.width=7.5}
+
+fastqc_output <- read_xlsx(here("data", "mtWGS", "slew_mtWGS_multiqc_general_stats.xlsx")) %>%
+  mutate(
+    read_type = case_when(
+      str_detect(sample_id, "_R1") ~ "F",
+      str_detect(sample_id, "_R2") ~ "R",
+      TRUE ~ NA_character_  # Handles cases where neither _R1 nor _R2 is found
+    ),
+    genus = case_when(
+      str_detect(sample_id, "20") ~ "Notropis",
+      !str_detect(sample_id, "20") ~ "Sphyrna",
+      TRUE ~ NA_character_  # Handles cases where neither condition is matched
+    )
+  )
+
+# plots
+
+## reads vs dupes
+
+ggplot(fastqc_output, aes(x = reads, y = `%_dupes`, fill = genus)) +
+  geom_point(shape = 21, size = 4, color = "black") +
+  #geom_vline(aes(xintercept = mean(reads, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+ # geom_vline(xintercept = 5e6, color = "red", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous("Reads", limits = c(0, 1.1e8), breaks = c(seq(0, 1.1e8, 2e7)), labels = c(seq(0, 1.1e8, 2e7))) +
+  scale_y_continuous("% Duplicates", limits = c(0, 100), breaks = c(seq(0, 100, 10)), labels = c(seq(0, 100, 10))) +
+  facet_grid(~read_type) +
+  theme_standard
+
+ggsave(here("data", "mtWGS", "slew_mtWGS_dupes_reads.png"))
+
+## reads vs failed
+
+ggplot(fastqc_output, aes(x = reads, y = `%_fail`, fill = genus)) +
+  geom_point(shape = 21, size = 4, color = "black") +
+  #geom_vline(aes(xintercept = mean(reads, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+ # geom_vline(xintercept = 5e6, color = "red", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous("Reads", limits = c(0, 1.1e8), breaks = c(seq(0, 1.1e8, 2e7)), labels = c(seq(0, 1.1e8, 2e7))) +
+  scale_y_continuous("% Fail", limits = c(0, 100), breaks = c(seq(0, 100, 10)), labels = c(seq(0, 100, 10))) +
+  facet_grid(~read_type) +
+  theme_standard
+
+ggsave(here("data", "mtWGS", "slew_mtWGS_failed_reads.png"))
+
+```
+
+## MitoZ
+
+Assemble mitochondrial genomes de novo using `MitoZ`.
+
+```{bash, eval = F}
+
+#!/bin/bash
+#SBATCH -J mitoz
+#SBATCH -o mitoz.out
+#SBATCH -e mitoz.err
+#SBATCH -N 1
+#SBATCH -n 64
+#SBATCH -p normal
+#SBATCH --mail-user=dominic.swift@tamucc.edu
+#SBATCH --mail-type=begin
+#SBATCH --mail-type=end
+#SBATCH --time=96:00:00
+
+source /home/dswift/.bashrc
+conda activate mitoz
+
+# export data directory as a variable
+
+## update as necessary
+
+export DIR="/work/marinegenomics/dswift/Workspace/scalloped_hh/mtWGS/raw"
+
+# assembly mt genomes
+
+## use loop to make a directory for each sample and assemble the mt genome
+
+ls $DIR/*_R1_001.fastq.gz | sed 's/_R1_001.fastq.gz//g' | cut -f9 -d"/" > samples.txt
+cat samples.txt | while read i ; do 
+    mkdir $i 
+    echo "Assembling and annotating $i" 
+    cd $i 
+    mitoz all --outprefix $i --thread_number 64 --clade Chordata --genetic_code 2 --species_name "Sphyrna lewini" --fq1 $DIR/${i}_R1_001.fastq.gz --fq2 $DIR/${i}_R2_001.fastq.gz --fastq_read_length 151 --data_size_for_mt_assembly 3,0  --assembler megahit --kmers_megahit 71 99 --memory 50 --requiring_taxa Chordata 2>> err.log 1>> tmp.log
+    echo "Mitochondrial genome assembled and annotated for $i"
+    cd ..
+done
+
+# make sure you have the correct species
+cat samples.txt | while read i; do
+    SAMPLE=$(echo $i | sed 's:/$::')
+    TAXA="Sphyrna lewini"
+    if [ ! -s $i/*.result/*.megahit.mitogenome.fa.result/summary.txt ]; then 
+        echo -e "Sample: ${i%/}, Taxa:$TAXA, No assembly"
+        continue
+    fi
+    BLAST=$(head -n2 $i/*.result/*.megahit.mitogenome.fa.result/summary.txt | tail -n1 | awk '{print $4,$5}')
+    echo -e "Sample: ${i%/}, Taxa: $TAXA, BLAST hit: $BLAST"
+done
+
+# change break point to tRNA-Phe and consolidating the results
+cat samples.txt | while read i; do
+    cd $i
+    echo "Breaking $i"
+    if [ ! -s $i.result/$i.$i.megahit.mitogenome.fa.result/${i}_${i}.megahit.mitogenome.fa_mitoscaf.fa.gbf ]; then
+        echo "$i does not have an assembly"; cd .. ; continue; 
+    fi
+    if [ ! -d breakpoint ]; then mkdir breakpoint; fi
+    cd breakpoint
+    if [ $(grep trnF ../$i.result/$i.$i.megahit.mitogenome.fa.result/${i}_${i}.megahit.mitogenome.fa_mitoscaf.fa.gbf | wc -l ) -eq 0 ]; then
+        echo "$i does not have tRNA-Phe. Please reconsider assembly"; continue;
+    fi
+    mitoz-tools gbfiletool sort -i ../$i.result/$i.$i.megahit.mitogenome.fa.result/${i}_${i}.megahit.mitogenome.fa_mitoscaf.fa.gbf -o $i.moved-breakpoint.gbf -g trnF\(gaa\) 2> err.log 1> tmp.log
+
+    # change the fasta file to match the genbank file
+    mitoz-tools gbseqextractor -f $i.moved-breakpoint.gbf -prefix $i.moved-breakpoint -types wholeseq 2>> err.log 1>> tmp.log
+
+    # add that the genome is circular to the fasta
+    awk 'NR==1{print $0, "topology=circular"; next}{print $0}' $i.moved-breakpoint.fasta > tmp; mv tmp $i.moved-breakpoint.fasta
+
+    # update the annotations
+    echo "Reannotating $i"
+    mitoz annotate --thread_number 64 --outprefix $i --fastafiles $i.moved-breakpoint.fasta --fq1 ../clean_data/$i.clean_R1.fq.gz --fq2 ../clean_data/$i.clean_R2.fq.gz --species_name "Sphyrna lewini" --genetic_code 2 --clade Chordata --template_sbt ~/bin/template.sbt 2> err.log 1> tmp.log
+    echo "Reannotation done!"
+
+    # update the images
+    echo "Revisualizing $i"
+    mitoz visualize --gb $i.$i.moved-breakpoint.fasta.result/${i}_${i}.moved-breakpoint.fasta_mitoscaf.fa.gbf --gc yes --run_map yes --fq1 ../clean_data/$i.clean_R1.fq.gz --fq2 ../clean_data/$i.clean_R2.fq.gz --thread 64 --outdir pics 2> err.log 1> tmp.log
+    echo "Revisualization done!"
+    cd ..
+
+    # move the result files to a central location
+
+    mkdir final_output
+    cp breakpoint/${i}.moved-breakpoint.gbf final_output/${i}.gbf
+    cp *.result/${i}.$i.megahit.mitogenome.fa.result/${i}_$i.megahit.mitogenome.fa_mitoscaf.fa.tbl final_output/${i}.tbl
+    cp *.result/${i}.$i.megahit.mitogenome.fa.result/summary.txt final_output/${i}_summary.txt
+    cp *.result/${i}.$i.megahit.mitogenome.fa.result/errorsummary.val final_output/
+    cp breakpoint/$i.moved-breakpoint.fasta final_output/${i}.fasta
+    cp *.result/${i}.$i.megahit.mitogenome.fa.result/circos.png final_output/${i}.png
+    cp *.result/${i}.$i.megahit.mitogenome.fa.result/circos.depth.txt final_output/${i}.depth.txt
+    cd ..
+    echo "Processing done for $i"
+done
+
+echo "Processing done for all!"
+
+# Create not_assembled.txt with samples that did not assemble
+echo "Checking for samples with no assembly..."
+> not_assembled.txt  # Create or clear the file
+
+cat samples.txt | while read i; do
+    if [ ! -s $i/*.result/*.megahit.mitogenome.fa.result/summary.txt ]; then
+        echo "$i" >> not_assembled.txt  # Append the sample name to the file
+    fi
+done
+
+echo "Samples with no assembly have been written to not_assembled.txt"
+
+# copy files to results
+
+cd ..
+cp -v lib*_complete/*/final_output/*fasta ./output/fasta/.
+cp -v lib*_complete/*/final_output/*.gbf ./output/genbank/.
+cp -v lib*_complete/*/final_output/*.depth.txt ./output/depth/.
+cp -v lib*_complete/*/final_output/*.png ./output/graphics/.
+cp -v lib*_complete/*/final_output/*_summary.txt ./output/summaries/.
+
+```
+
+## Assess Coverage by Individual and SNP
+
+Which samples did not assemble correctly?
+
+```{r, message=F, warning=F, fig.height=5, fig.width=5}
+
+# List all files ending in ".depth.txt" in the target directory
+
+file_paths <- list.files(here("data", "mtWGS", "depth"), pattern = "\\.depth\\.txt$", full.names = TRUE)
+
+# read and combine all .txt files into a single tibble
+
+stats_summary <- file_paths %>%
+  set_names() %>%  # Sets file paths as names, which we'll use for `sample_id`
+  map_df(~ read_delim(.x, delim = " ", col_names = c("mt", "temp", "base", "depth")) %>%
+           select(base, depth) %>%
+           mutate(sample_id = basename(.x) %>% str_remove("\\.depth\\.txt$"), .before = "base")) %>% 
+  group_by(sample_id) %>% 
+  summarise(length = max(base),
+            min = min(depth),
+            mean = round(mean(depth), 0),
+            median = median(depth),
+            max = max(depth)) %>% 
+  full_join(., genewiz_output) %>% 
+  mutate(assembly = ifelse(is.na(length), "NO", "YES"))
+
+# no assembly
+
+no_assembly <- stats_summary %>% 
+  filter(is.na(length) | length < 16722) %>% 
+  select(sample_id) %>% 
+  write_delim(., here("data", "mtWGS", "no_assembly.txt"), delim = "/t", col_names = F)
+
+# plots
+
+ggplot(stats_summary, aes(x = reads, fill = assembly)) +
+  geom_histogram(binwidth = 5e5, color = "black") +
+  scale_fill_manual(values=c("red", "grey")) +
+  geom_vline(xintercept = 2e6, color = "red", linetype = "dashed", linewidth = 1) +
+  labs(x = "Reads") +
+  theme_standard
+
+```
+
+## Consensus Sequences
+
+Produce a consensus sequence by aligning `.fastq.gz` files to reference mt genome.
+
+```{bash, eval = F}
+
+#!/bin/bash
+
+# Set paths
+REFERENCE="/home/dswift/projects/hammerheads/nurseries/results/slew_mt_genome.fasta"
+RAW_READS_DIR="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/raw_reads"
+TMP_DIR="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/tmp"
+CONSENSUS_DIR="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/consensus"
+
+# Create necessary directories
+mkdir -p $TMP_DIR
+mkdir -p $CONSENSUS_DIR
+
+# Step 1: Index the reference genome (only needs to be done once)
+echo "Indexing the reference genome..."
+samtools faidx $REFERENCE
+bwa index $REFERENCE
+
+# Step 2: Loop through each pair of FASTQ files in the raw reads directory
+for READ1 in "$RAW_READS_DIR"/*_R1_001.fastq.gz; do
+  # Define the corresponding R2 file and sample name based on R1 file
+  READ2=${READ1/_R1_/_R2_}
+  SAMPLE_NAME=$(basename $READ1 _R1_001.fastq.gz)
+
+  echo "Processing sample: $SAMPLE_NAME"
+  
+  # Align reads to the reference and convert SAM to BAM
+  bwa mem -t 20 $REFERENCE $READ1 $READ2 > $TMP_DIR/$SAMPLE_NAME.sam
+  samtools view -bS -@ 20 $TMP_DIR/$SAMPLE_NAME.sam > $TMP_DIR/$SAMPLE_NAME.bam
+  
+  # Sort the BAM file and index it
+  samtools sort -@ 20 $TMP_DIR/$SAMPLE_NAME.bam -o $TMP_DIR/$SAMPLE_NAME.sort.bam
+  samtools index -@ 20 $TMP_DIR/$SAMPLE_NAME.sort.bam
+
+  # Remove intermediate files to save space
+  rm $TMP_DIR/$SAMPLE_NAME.sam $TMP_DIR/$SAMPLE_NAME.bam
+
+  # Step 3: Generate VCF and consensus sequence for each sample
+  echo "Generating VCF and consensus sequence for $SAMPLE_NAME..."
+  bcftools mpileup -f $REFERENCE $TMP_DIR/$SAMPLE_NAME.sort.bam | \
+    bcftools call -mv -Oz -o $TMP_DIR/$SAMPLE_NAME.variants.vcf.gz
+  bcftools index $TMP_DIR/$SAMPLE_NAME.variants.vcf.gz
+  
+  # Generate consensus sequence and rename the contig
+  bcftools consensus -f $REFERENCE $TMP_DIR/$SAMPLE_NAME.variants.vcf.gz -o $CONSENSUS_DIR/$SAMPLE_NAME.consensus.fasta
+  sed -i "s/^>.*$/>$SAMPLE_NAME/" $CONSENSUS_DIR/$SAMPLE_NAME.consensus.fasta
+done
+
+# Clean up the temporary directory
+rm -r $TMP_DIR
+
+echo "All samples processed. Consensus sequences saved in $CONSENSUS_DIR."
+
+```
+
+Rename consensus sequence and contig name.
+
+```{bash}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/mtWGS/
+
+# Paths to CSV file and FASTA directory
+csv_file="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/slew_mtWGS_sample_ids.csv"
+fasta_dir="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/consensus"
+
+# Read the CSV file and iterate through each line, skipping the header
+while IFS=',' read -r current_prefix desired_prefix; do
+    # Skip the header
+    if [[ "$current_prefix" != "current_prefix" ]]; then
+        # Clean the carriage return from the prefixes
+        current_prefix=$(echo "$current_prefix" | tr -d '\r')
+        desired_prefix=$(echo "$desired_prefix" | tr -d '\r')
+
+        # Define the input FASTA file with current prefix and the new name with desired prefix
+        input_fasta="$fasta_dir/${current_prefix}.consensus.fasta"
+        output_fasta="$fasta_dir/${desired_prefix}.consensus.fasta"
+
+        # Rename the FASTA file if it exists
+        if [[ -f "$input_fasta" ]]; then
+            mv "$input_fasta" "$output_fasta"
+            
+            # Rename the contig within the FASTA file to match the desired prefix (file name)
+            sed -i "s/^>.*/>$desired_prefix/" "$output_fasta"
+        else
+            echo "Warning: File $input_fasta not found."
+        fi
+    fi
+done < "$csv_file"
+
+```
+
+## Align and Examine Sequences
+
+Align mt genome assembles and consensus sequences for those without an assembly.
+
+```{bash}
+
+conda activate mtwgs
+
+# Set working directory to align
+haplotype_dir="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/haplotype"
+mitoz_dir="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/mitoz"
+consensus_dir="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/consensus"
+not_assembled_file="/home/dswift/projects/hammerheads/nurseries/data/mtWGS/no_assembly.txt"
+
+# Change to haplotype directory
+cd "$haplotype_dir" || exit
+
+# Define output file names
+temp_concat_file="temp_slew_mt_gen.fasta"
+output_concat_file="slew_mt_gen.fasta"
+output_alignment_file="slew_mt_gen_align.fasta"
+
+# Create or clear the temporary file for concatenation
+> "$temp_concat_file"
+
+# Concatenate all FASTA files in mitoz directory
+for fasta_file in "$mitoz_dir"/*.fasta; do
+    cat "$fasta_file" >> "$temp_concat_file"
+done
+
+# Concatenate FASTA files from consensus directory if listed in not_assembled.txt
+while IFS= read -r file_base; do
+    consensus_fasta="$consensus_dir/${file_base}.consensus.fasta"
+    if [[ -f "$consensus_fasta" ]]; then
+        cat "$consensus_fasta" >> "$temp_concat_file"
+    else
+        echo "Warning: File $consensus_fasta not found in consensus directory."
+    fi
+done < "$not_assembled_file"
+
+# Move concatenated sequences to the final output file
+mv "$temp_concat_file" "$output_concat_file"
+echo "FASTA files concatenated into $output_concat_file."
+
+# Run MAFFT alignment on the concatenated FASTA file
+echo "Starting alignment with MAFFT..."
+mafft --auto --thread 64 "$output_concat_file" > "$output_alignment_file"
+echo "Alignment completed. Output saved to $output_alignment_file."
+
+echo "mt_align script finished."
+
+```
+
+Open alignment in `BioEdit`, revise ambiguities to match other sequences, and remove indels if only present in 1 sample.
+
+# mtDNA Haplotypes
+
+```{r, message=F, warning=F, fig.height=5, fig.width=5}
+
+slew_strata <- read_csv(here("data", "filter", "slew_nurseries_strata.csv"))
+
+# import FASTA file
+
+slew_mt_align <- read.fas(file=here("data", "mtWGS", "haplotype", "slew_align_11.24.25.fasta"))
+
+slew_mt_align
+
+# compute an absolute pairwise character difference matrix from DNA sequence, with coding gaps parsed using simple indel coding method
+
+dist_mat <- distance(slew_mt_align, indels = "sic")
+
+hap_dist <- melt(as.matrix(dist_mat), varnames = c("seq1", "seq2")) %>% 
+  rename(SNPs = value) %>% 
+  filter(seq1 != seq2) %>%
+  mutate(seq1 = str_replace_all(seq1, "_", "-")) %>% 
+  mutate(seq2 = str_replace_all(seq2, "_", "-"))
+
+# infer haplotypes with coding gaps parsed using simple indel coding method
+
+hap <- haplotypes::haplotype(slew_mt_align, indels="s")
+
+hap_list <- hap@haplist
+
+# assess haplotypes
+
+hap_df <- purrr::map_dfr(hap_list, ~ as.data.frame(t(.x))) %>%
+  rowwise() %>%
+  mutate(non_na_count = sum(!is.na(c_across(everything())))) %>%
+  ungroup() %>%
+  arrange(desc(non_na_count)) %>%
+  select(-non_na_count) %>% 
+  rownames_to_column("haplotype") %>% 
+  pivot_longer(-haplotype) %>%
+  pivot_wider(names_from=haplotype, values_from=value) %>%
+  select(-name) %>%
+  pivot_longer(cols = everything(), values_to = "seq_id", names_to = "haplotype") %>%
+  select(seq_id, haplotype) %>% 
+  drop_na(seq_id) %>% 
+  mutate(haplotype = str_pad(haplotype, width = 2, pad = "0")) %>% 
+  arrange(haplotype) %>% 
+  mutate(seq_id = gsub("_", "-", seq_id)) %>% 
+  distinct(seq_id, .keep_all = TRUE) %>% 
+  mutate(seq_id = str_replace(seq_id, "-", "_")) %>% 
+  write_csv(., here("data", "mtWGS", "haplotype", "slew_hap_df.csv"))
+
+hap_df_nursery <- hap_df %>% 
+  left_join(slew_strata)
+
+hap_counts <- hap_df %>% 
+  count(haplotype)
+
+hap_nurseries <- hap_df %>% 
+  left_join(., slew_strata) %>% 
+  group_by(haplotype, nursery) %>% 
+  count()
+
+ggplot(hap_dist, aes(x = SNPs)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "grey") +
+#  geom_vline(aes(xintercept = 2), color = "red", linetype = "dashed", size = 1) +
+  #facet_grid(type ~ .) +
+  scale_x_continuous("mt SNPs", limits = c(0, 800), breaks = c(seq(0, 800, 100)), labels = c(seq(0, 800, 100))) +
+   #scale_y_continuous("n", limits = c(0, 12), breaks = c(seq(0, 12, 2)), labels = c(seq(0, 12, 2))) +
+  theme_standard
+
+hap_dist %>% 
+  filter(SNPs < 20) %>% 
+  ggplot(., aes(x = SNPs)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+#  geom_vline(aes(xintercept = 2), color = "red", linetype = "dashed", size = 1) +
+  #facet_grid(type ~ .) +
+  scale_x_continuous("mt SNPs", limits = c(0, 25), breaks = c(seq(0, 25, 5)), labels = c(seq(0, 25, 5))) +
+   #scale_y_continuous("n", limits = c(0, 12), breaks = c(seq(0, 12, 2)), labels = c(seq(0, 12, 2))) +
+  theme_standard
+
+diverged_haps <- hap_dist %>% 
+  filter(SNPs > 20) %>% 
+  group_by(seq1) %>% 
+  count() %>% 
+  filter(n > 2)
+
+# calculate haplotype diversity
+
+dna <- read.dna(here("data", "mtWGS", "haplotype", "slew_align_no_sibs_11.24.25.fasta"), format = "fasta")
+
+haplotypes <- pegas::haplotype(dna)
+
+hap_div <- hap.div(haplotypes)
+
+print(hap_div)
+
+nuc_div <- nuc.div(haplotypes, pairwise.deletion = F)
+
+print(nuc_div)
+
+nuc_div <- nuc.div(haplotypes, pairwise.deletion = T)
+
+print(nuc_div)
+
+```
+
+# Relationships
+
+Collect info on mitochondrial haplotypes to delineate kin types and assess distribution across space and time.
+
+```{r, message=F, warning=F, fig.height=5, fig.width=5}
+
+hap_df <- read_csv(here("data", "mtWGS", "haplotype", "slew_hap_df.csv"))
+
+sibs <- read_csv(here("data", "related", "slew_nurseries_sibs.csv")) %>% 
+  left_join(hap_df, by = c("seq_id1" = "seq_id")) %>% 
+  rename(mthap1 = haplotype) %>% 
+  relocate(mthap1, .after = "sex1") %>% 
+  left_join(hap_df, by = c("seq_id2" = "seq_id")) %>% 
+  rename(mthap2 = haplotype) %>% 
+  relocate(mthap2, .after = "sex2") %>% 
+  mutate(same_mt_hap = if_else(mthap1 == mthap2, "yes", "no"), .after = "type") %>% 
+  mutate(same_nursery = ifelse(nursery1 == nursery2, "yes", "no")) %>% 
+  mutate(year_diff = abs(year(date1) - year(date2))) %>% 
+  write_csv(., here("data", "related", "slew_nurseries_sibs_mt_haps.csv"))
+
+hs_yoy_same_nursery_diff_year <- sibs %>% 
+  filter(type == "hs") %>% 
+  filter(stage1 == "YOY" & stage2 == "YOY") %>% 
+  filter(same_nursery == "yes") %>% 
+  filter(year_diff > 0)
+
+
+mhs_yoy_diff_year <- sibs %>% 
+  filter(type == "hs") %>% 
+  filter(same_mt_hap == "yes") %>% 
+  filter(stage1 == "YOY" & stage2 == "YOY") %>% 
+  filter(year_diff > 0)
+
+```
+
+Plot clusters / pairs.
+
+```{r fig.height=11, fig.width=14, message=FALSE}
+
+slew_strata <- read_csv(here("data", "filter", "slew_nurseries_strata.csv")) %>% 
+  mutate(
+    Nursery = dplyr::recode(nursery, !!!nursery_map),
+    Nursery = factor(Nursery, levels = nursery_order_full)
+  )
+
+pairs <- read_csv(here("data", "related", "slew_nurseries_sibs_mt_haps.csv")) %>% 
+  rename(id_1 = seq_id1, id_2 = seq_id2) %>% 
+  mutate(conn_comp = 1,
+         year_diff = days_diff / 365.25) %>% 
+  mutate(year_diff = round(year_diff, 0)) %>% 
+  mutate(Relationship = case_when(type %in% "fs" ~ "Full-Sibling",
+                                  type %in% "hs" & same_mt_hap %in% "yes" ~ "Maternal Half-Sibling",
+                                  type %in% "hs" & same_mt_hap %in% "no" ~ "Paternal Half-Sibling",
+                                  type %in% "hs" & is.na(same_mt_hap) ~ "Undetermined Half-Sibling")) %>% 
+  mutate(year_diff = factor(year_diff, levels = sort(unique(year_diff)))) %>% 
+  select(id_1, id_2, conn_comp, Relationship, year_diff)
+
+fi_graph <- pairs %>% 
+  rename(from = id_1, to = id_2) %>% 
+  igraph::graph_from_data_frame(directed = FALSE) %>% 
+  tidygraph::as_tbl_graph()
+
+sib_clusters <- fi_graph %>% 
+  igraph::components() %>% 
+  .$membership %>% 
+  enframe(name = "seq_id", value = "cluster") %>% 
+  arrange(cluster) %>% 
+  group_by(cluster) %>% 
+  mutate(cluster_size = n()) %>%
+  ungroup() %>% 
+  left_join(slew_strata, by = "seq_id") %>% 
+  select(cluster, cluster_size, seq_id, Nursery, sex) %>%
+  mutate(Nursery = factor(Nursery, levels = nursery_order_full))
+
+fi_graph2 <- fi_graph %>% 
+  tidygraph::activate(nodes) %>%
+  tidygraph::left_join(sib_clusters, by = c("name" = "seq_id"))
+
+# order clusters by number of inds
+comp_vec <- igraph::components(fi_graph2)$membership
+fi_graph2 <- igraph::set_vertex_attr(fi_graph2, "comp", value = comp_vec)  # node attr
+fi_graph2 <- igraph::set_edge_attr(
+  fi_graph2, "comp",
+  value = comp_vec[igraph::ends(fi_graph2, igraph::E(fi_graph2))[, 1]]
+)
+
+# ensure clusters are plotted as separate facets
+fi_graph2_conn <- fi_graph2 %>%
+  tidygraph::activate(nodes) %>%
+  dplyr::filter(tidygraph::centrality_degree(mode = "all") > 0)
+
+# ensure clusters are plotted as separate facets
+fi_graph2_conn <- fi_graph2 %>%
+  tidygraph::activate(nodes) %>%
+  dplyr::filter(tidygraph::centrality_degree(mode = "all") > 0)
+
+# >>> INSERT THIS WHOLE BLOCK HERE <<<
+# ---- facet ordering keys per component ----
+# ---- facet ordering keys per component ----
+# Node summary: within/between and nursery rank(s)
+comp_node_summ <- fi_graph2_conn %>%
+  tidygraph::activate(nodes) %>%
+  as_tibble() %>%
+  select(comp, Nursery) %>%
+  group_by(comp) %>%
+  summarise(
+    n_nodes       = n(),
+    n_nurseries   = n_distinct(Nursery),
+    # rank of each nursery according to your canonical order
+    nursery_ranks = list(match(as.character(Nursery), nursery_order_full)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    within_nursery = n_nurseries == 1L,
+    # anchor nursery for ordering:
+    #  - within: the single nursery in the component
+    #  - between: the "first" nursery present (min rank)
+    nursery_rank   = purrr::map_int(nursery_ranks, ~ min(.x, na.rm = TRUE))
+  )
+
+# ensure partner_rank exists (2nd-lowest nursery), keeps your existing columns
+comp_node_summ <- comp_node_summ %>%
+  mutate(
+    partner_rank = purrr::map_int(
+      nursery_ranks,
+      ~ {
+        rs <- sort(unique(.x))
+        dplyr::nth(rs, 2, default = NA_integer_)
+      }
+    )
+  )
+
+# Edge summary: min year difference per component
+comp_edge_summ <- fi_graph2_conn %>%
+  tidygraph::activate(edges) %>%
+  as_tibble() %>%
+  transmute(
+    comp,
+    year_num = suppressWarnings(as.numeric(as.character(year_diff)))
+  ) %>%
+  group_by(comp) %>%
+  summarise(
+    min_year = min(year_num, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+# Final order:
+# 1) within-nursery first
+# 2) by nursery (anchor rank)
+# 3) n_nodes (desc)
+# 4) relationship priority (FS first)
+# 5) year difference (smaller first)
+# 6) then between-nursery by nursery (anchor rank)
+comp_order <- comp_node_summ %>%
+  left_join(comp_edge_summ, by = "comp") %>%
+  mutate(
+    min_year     = dplyr::coalesce(min_year, Inf),
+    partner_sort = dplyr::coalesce(partner_rank, 999L)  # safe tie-break for between only
+  ) %>%
+  arrange(
+    # ---- WITHIN-NURSERY block ----
+    dplyr::desc(within_nursery),
+    nursery_rank,
+    min_year,
+    dplyr::desc(n_nodes),
+
+    # ---- BETWEEN-NURSERY block ----
+    nursery_rank,          # nursery1
+    partner_sort,          # nursery2 (stable even when NA)
+    min_year,
+    dplyr::desc(n_nodes)
+  ) %>%
+  transmute(comp_chr = as.character(comp)) %>%
+  pull(comp_chr)
+
+
+# Apply ordered levels to both nodes and edges
+fi_graph2_conn <- fi_graph2_conn %>%
+  tidygraph::activate(nodes) %>%
+  mutate(comp = factor(as.character(comp), levels = comp_order)) %>%
+  tidygraph::activate(edges) %>%
+  mutate(comp = factor(as.character(comp), levels = comp_order)) %>%
+  tidygraph::activate(nodes)# >>> END INSERT <<<
+
+# add partner_rank (2nd-lowest nursery in a component) for between-nursery grouping
+comp_node_summ <- comp_node_summ %>%
+  mutate(
+    partner_rank = purrr::map_int(
+      nursery_ranks,
+      ~ {
+        rs <- sort(unique(.x))
+        dplyr::nth(rs, 2, default = NA_integer_)
+      }
+    )
+  )
+
+# OPTIONAL: insert blank panels between blocks while preserving order
+add_gaps <- TRUE
+if (add_gaps) {
+  ord_tbl <- tibble(comp_chr = comp_order) %>%
+    left_join(
+      comp_node_summ %>%
+        transmute(comp = as.character(comp),
+                  within_nursery, nursery_rank, partner_rank),
+      by = c("comp_chr" = "comp")
+    ) %>%
+    mutate(
+      block_id = dplyr::if_else(
+        within_nursery,
+        sprintf("W%02d", nursery_rank),                  # within by nursery1
+        sprintf("B%02d_%02d", nursery_rank, partner_rank) # between by (nursery1, nursery2)
+      )
+    )
+
+  split_levels <- split(ord_tbl$comp_chr, ord_tbl$block_id)
+  block_names  <- unique(ord_tbl$block_id)  # preserves current comp_order
+  spacered <- purrr::map(block_names, function(b) {
+    c(split_levels[[b]], paste0("— gap after ", b))
+  }) %>% unlist(use.names = FALSE)
+
+  comp_levels_gapped <- unique(spacered)
+} else {
+  comp_levels_gapped <- comp_order
+}
+
+# Reapply levels (unchanged)
+fi_graph2_conn <- fi_graph2_conn %>%
+  tidygraph::activate(nodes) %>%
+  mutate(comp = factor(as.character(comp), levels = comp_levels_gapped)) %>%
+  tidygraph::activate(edges) %>%
+  mutate(comp = factor(as.character(comp), levels = comp_levels_gapped)) %>%
+  tidygraph::activate(nodes)
+
+# >>> DELETE / COMMENT OUT THIS ENTIRE BLOCK (it overwrites the order above) <<<
+# # order facets by cluster (i.e., most inds first)
+# node_sizes <- fi_graph2_conn %>%
+#   tidygraph::activate(nodes) %>%
+#   tibble::as_tibble() %>%
+#   dplyr::count(comp, name = "n_nodes")
+# comp_levels <- node_sizes %>%
+#   dplyr::mutate(comp_chr = as.character(comp)) %>%
+#   dplyr::arrange(dplyr::desc(n_nodes), as.numeric(comp_chr)) %>%
+#   dplyr::pull(comp_chr)
+# fi_graph2_conn <- fi_graph2_conn %>%
+#   tidygraph::activate(nodes) %>%
+#   dplyr::mutate(comp = factor(as.character(comp), levels = comp_levels)) %>%
+#   tidygraph::activate(edges) %>%
+#   dplyr::mutate(comp = factor(as.character(comp), levels = comp_levels)) %>%
+#   tidygraph::activate(nodes)
+
+# --- plot ---
+
+# switch to a force-directed layout suited for multiple small panels
+# facet one panel per connected component; free scales so panels pack nicely
+# use theme_void + spacing + expansions to mimic the style of the second example
+
+types_full <- c("Full-Sibling",
+                "Maternal Half-Sibling",
+                "Paternal Half-Sibling",
+                "Undetermined Half-Sibling")
+
+# produce palete with grey for same year
+
+ints <- sort(unique(pairs$year_diff))
+
+cols <- c(
+  "0" = "grey",
+  setNames(viridisLite::viridis(length(ints)), as.character(ints))
+)
+
+ggraph::ggraph(fi_graph2_conn, layout = "auto") +
+  geom_edge_link(
+    aes(edge_linetype = Relationship,
+        color = year_diff), 
+    alpha = 1, width = 1) +
+  geom_node_point(
+    aes(fill = Nursery, 
+        shape = sex, 
+        #size = cohort
+        ),
+    color = "black",
+    stroke = 0.5,
+    size = 3.5,
+    alpha = 1
+  ) +
+  scale_shape_manual(
+    name = "Sex",
+    values = c(21, 24, 22), 
+    labels = c("Female", "Male", "Unsexed"), 
+    ) +
+  scale_fill_manual(
+    name   = "Nursery",
+    values = nursery_colors,  # named vector, aligned to full order
+    breaks = nursery_order_full,                  # legend order = your canonical order
+    limits = nursery_order_full,                  # keep full set
+    drop   = FALSE                                # <- do NOT drop unused levels
+  )  +
+  scale_edge_linetype_manual(
+    values = c("solid", "dashed", "dotted", "dotdash"),
+    labels = types_full,
+    breaks = types_full
+  ) +
+  scale_edge_color_manual(
+    "Year Difference",
+    values = cols,
+    breaks = sort(unique(pairs$year_diff)),
+    labels = sort(unique(pairs$year_diff)),
+    ) +
+  coord_cartesian(clip = "off") +
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  facet_wrap(~ comp, 
+             #nrow = 3, 
+             scales = "free"
+             ) +
+facet_wrap(
+  ~ comp,
+  scales  = "free",
+  drop    = FALSE,
+  labeller = labeller(
+    comp = function(x) ifelse(grepl("^— gap", x), "", x)
+  )
+) +
+  theme_void() +
+  theme(
+    aspect.ratio      = 1,
+    legend.position   = "right",
+    legend.box.margin = ggplot2::margin(0, 0, 0, 10),
+    legend.title = element_text(size = 16),
+    legend.text  = element_text(size = 14),    
+    panel.spacing.y   = grid::unit(0.5, "lines"),
+    panel.spacing.x   = grid::unit(0.5, "lines"),
+    strip.text        = ggplot2::element_blank(),
+    plot.margin       = ggplot2::margin(0, 0, 0, 0),
+    # add label to each facet
+    #strip.text.x = element_text()
+  ) +
+  guides(
+    fill          = guide_legend(
+                     override.aes = list(size = 5, shape = 23, color = "black", stroke = 0.5),
+                     order = 1
+                   ),
+    edge_linetype = guide_legend(override.aes = list(edge_alpha = 1, size = 2), order = 2),
+    edge_color    = guide_legend(override.aes = list(edge_alpha = 1, size = 2), order = 3),
+    shape         = guide_legend(override.aes = list(size = 4), order = 4)
+  )
+
+ggsave(here("data", "related", "slew_nurseries_kin.pdf"))
+
+
+```
+
+# Produce Datasets
+
+```{r, message=F}
+
+slew.gen <- read.genepop(file = here("data", "filter", "slew_nurseries_filt.gen"), ncode = 3L, quiet = FALSE)
+
+slew_strata <- read_csv(here("data", "filter", "slew_nurseries_strata.csv"))
+
+slew_strata <- indNames(slew.gen) %>% 
+  as_tibble_col("seq_id") %>% 
+  left_join(., slew_strata)
+
+strata(slew.gen) <- slew_strata
+
+setPop(slew.gen) <- ~nursery
+
+```
+
+Remove one individual in each sibling pair and export.
+
+```{r, message=F}
+
+remove_sibs <- read_csv(here("data", "related", "slew_nurseries_sibs_mt_haps.csv"))
+
+# which seq_id should you use to remove inds?
+
+length(unique(remove_sibs$seq_id1))
+length(unique(remove_sibs$seq_id2))
+
+### use seq_id1 ###
+
+# remove and export
+
+slew_no_sibs_strata <- slew_strata %>% 
+  filter(!seq_id %in% remove_sibs$seq_id1) %>% 
+  write_csv(., here("results", "slew_no_sibs_strata.csv"))
+
+slew_no_sibs.gen <- gen.ind.rem.Ind(slew.gen, remove_sibs$seq_id1)
+
+strata(slew_no_sibs.gen) <- slew_no_sibs_strata
+
+setPop(slew_no_sibs.gen) <- ~nursery
+
+slew_no_sibs.gen$pop <- factor(slew_no_sibs.gen$pop, levels=nursery_order)
+
+writeGenPop(slew_no_sibs.gen, file.name = here("results", "slew_no_sibs.gen"), comment = "slew_no_sibs.gen")
+
+```
+
+PCA to confirm sibs were removed.
+
+```{r fig.height=7, fig.width=7, message=FALSE, warning=FALSE}
+
+x <- tab(slew_no_sibs.gen, freq=TRUE, NA.method="mean")
+
+pca <- dudi.pca(df = x, center = TRUE, scale = FALSE, scannf = FALSE, nf = 10)
+
+eig <- eigenvalues(pca)
+
+pc_inds  <- PC.ind(pca) %>%
+  left_join(., slew_no_sibs_strata) %>% 
+  mutate(nursery = factor(nursery, levels = nursery_order))
+
+ggplot(pc_inds , aes(x = Axis1, y = Axis2, label = nursery, fill = nursery, color = nursery)) +
+  geom_point(alpha = 0.75, size = 4) +
+  labs(x = paste("PC1:", round(eig[1, 3]*100, digits = 3), "%"), 
+       y = paste("PC2:", round(eig[2, 3]*100, digits = 3), "%")) +
+  scale_color_manual(values = nursery_colors) +
+  scale_fill_manual(values = nursery_colors) +
+  theme_standard +
+  theme(legend.text=element_text(size=10), legend.title=element_text(10), plot.title = element_text(size = 14, hjust = 0.5, vjust = 0.25), axis.text=element_text(size=10)) 
+#+
+  #stat_ellipse(level = 0.95)
+
+```
+

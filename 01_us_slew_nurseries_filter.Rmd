@@ -1,0 +1,3244 @@
+---
+title: "United States Scalloped Hammerhead Nurseries, SNP Filtering"
+output: 
+  html_notebook: 
+    highlight: kate
+    theme: flatly
+    toc: yes
+  html_document: 
+    toc: yes
+---
+
+# Environment
+
+```{r Load packages/functions, message=FALSE, warning=FALSE}
+
+.libPaths("/usr/lib64/R/library")
+
+# invalidate cache when the package version changes
+
+knitr::opts_chunk$set(
+  root.dir = "~/projects/hammerheads/nurseries",
+	message = FALSE,
+	warning = FALSE,
+  cache.extra = packageVersion("tint"),
+	tidy = FALSE,
+	echo = FALSE)
+
+options(htmltools.dir.version = FALSE)
+
+# conflicts
+
+library(conflicted)
+conflict_prefer("count", "dplyr")
+conflict_prefer("arrange", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("summarise", "dplyr")
+conflict_prefer("summarize", "dplyr")
+conflict_prefer("s.label", "adegraphics")
+conflict_prefer("s.value", "adegraphics")
+conflict_prefer("scalebar", "raster")
+conflict_prefer("rename", "dplyr")
+conflicts_prefer(dplyr::filter)
+
+# packages
+
+library(tidyverse)
+library(patchwork)
+library(here)
+library(readxl)
+library(writexl)
+library(broom)
+library(vcfR)
+library(adegenet)
+library(glue)
+library(related)
+library(clock)
+library(lubridate)
+library(zvau)
+library(OutFLANK)
+library(hierfstat)
+library(poppr)
+library(viridis)
+library(rgdal)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggspatial)
+library(RColorBrewer)
+library(leaflet)
+
+# source functions
+
+source("~/bin/genind.R")
+source("~/bin/PCA.R")
+source("~/bin/ggplot.R")
+source("~/bin/DAPC.R")
+source("~/bin/VCFfilterstats.R")
+source("~/bin/HaplotypR.R")
+
+```
+
+# Sample Data
+
+On the HPC, use `TotalRawSNPs.vcf` to produce a list of all samples that were genotyped.
+
+```{bash}
+
+cd /work/marinegenomics/dswift/Workspace/scalloped_hh/
+
+vcfsamplenames SNP_calling/vcf/TotalRawSNPs.vcf > filter/scalloped_raw.ind
+
+```
+
+Import list of all genotyped samples and sample data in AMB's `Compiled_Sample_Sheet.xlsx` to produce `sample_info`. 
+
+```{r warning = FALSE, message = FALSE}
+
+ind_raw <- read_delim(here("data", "filter", "scalloped_raw.ind"), delim = "\t", col_names = "seq_id")
+
+sample_info <- read_excel(here("Compiled_Sample_Sheet.xlsx")) %>% 
+  rename(seq_id = sample_id) %>% 
+  left_join(ind_raw, .) %>% 
+  separate(seq_id, into = c("temp", "replicate"), sep = 10, remove = FALSE) %>% 
+  select(-c(temp, previous_id, location, state)) %>%
+  mutate_at(vars(tl_mm), funs(round(., 0))) %>%
+  mutate_at(c("latitude", "longitude"), as.numeric) %>%
+  mutate_at(c("latitude", "longitude"), funs(round(., 5)))
+
+```
+
+# Retain Only YOY and Small Juveniles from U.S. Waters
+
+```{r fig.height=6, fig.width=6, message=FALSE, warning=FALSE}
+
+gen <- read.vcfR(here("data", "filter", "Final_Filt.recode.vcf")) %>% 
+  vcfR2genind()
+
+inds <- as.data.frame(indNames(gen)) %>%
+  rename(seq_id = `indNames(gen)`)
+
+sample_info <- left_join(inds, sample_info)
+
+yoy_smjuv_us <- sample_info %>% 
+  filter(!if_any(c(latitude, longitude), is.na)) %>% 
+  filter(country == "USA") %>% 
+  filter(stage == "YOY" | stage == "SM_JUV") %>% 
+  filter(library != "SLH04") # also remove samples from library 4
+
+remove_ind <- anti_join(sample_info, yoy_smjuv_us)
+
+temp.gen <- gen.ind.rem.Ind(gen, remove_ind$seq_id)
+
+x <- tab(temp.gen, freq=TRUE, NA.method="mean")
+
+pca <- dudi.pca(df = x, center = TRUE, scale = FALSE, scannf = FALSE, nf = 10)
+
+eig <- eigenvalues(pca)
+
+# Plot
+
+pc_inds  <- PC.ind(pca) %>%
+  left_join(., sample_info)
+
+# plot by nursery
+
+ggplot(pc_inds , aes(x = Axis1, y = Axis2, fill = nursery), color = "black") +
+  geom_point(alpha = 0.75, size = 4, shape = 21) +
+  labs(x = paste("PC1:", round(eig[1, 3], digits = 3)), 
+       y = paste("PC2:", round(eig[2, 3], digits = 3))) +
+  ggtitle("By Nursery") +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  guides(fill=guide_legend(nrow=3, byrow=TRUE))
+
+# plot by library
+
+ggplot(pc_inds , aes(x = Axis1, y = Axis2, fill = library), color = "black") +
+  geom_point(alpha = 0.75, size = 4, shape = 21) +
+  labs(x = paste("PC1:", round(eig[1, 3], digits = 3)), 
+       y = paste("PC2:", round(eig[2, 3], digits = 3))) +
+  ggtitle("By Library") +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  guides(fill=guide_legend(nrow=3, byrow=TRUE))
+
+```
+
+Library effects are present and will need to be filtered.
+
+Produce sample data and a list of samples to retain.
+
+First, keep individuals only from nurseries > 50 samples.
+
+```{r}
+
+sample_info %>% 
+  filter(stage == "YOY" | stage == "SM_JUV") %>% 
+  filter(!is.na(nursery)) %>% 
+  count(nursery) %>% 
+  arrange(desc(n))
+
+```
+
+Keep individuals from top 5 nurseries and others.
+
+```{r}
+
+keep_nurseries <- c("BB", "CB", "TR", "FPH", "CCB")
+
+remove_inds <- c("GA_088-17", "NF_265-18", "NF_239-18", "NF_163-17", "NF_262-18", "NF_249-18", "NF_237-18", "NF_113-15")
+
+slew_sample_data <- sample_info %>% 
+  filter(seq_id %in% pc_inds$seq_id) %>% 
+  filter(!seq_id %in% remove_inds) %>% 
+  filter(nursery %in% keep_nurseries) %>% 
+  separate(date, into = c("day", "month", "year"), sep = "[.]", convert = T) %>% 
+  write_csv(., here("data", "filter", "slew_nurseries_sample_data.csv"))
+
+keep_ind <- slew_sample_data %>% 
+  select(seq_id) %>% 
+  write_delim(., here("data", "filter", "slew_nurseries.ind"), delim = "\t", col_names = F)
+
+```
+
+# Produce Map of Samples
+
+Download map data.
+
+```{r fig.height=10.5, fig.width=19, message=FALSE, warning=FALSE}
+
+# Create basemap
+
+map <- readOGR(dsn = here("maps"), layer = "ne_10m_land")
+
+map <- tidy(map) %>%
+  filter(long >= -105 & long <= -75 & lat >= 17 & lat <= 34) %>%
+  droplevels()
+
+# Nation lines basemap
+
+nations <- readOGR(dsn = here("maps"), layer = "ne_10m_admin_0_countries")
+
+nations <- tidy(nations) %>%
+  filter(long >= -105 & long <= -75 & lat >= 17 & lat <= 34) %>%
+  droplevels()
+
+# State line basemap
+
+states <- readOGR(dsn = here("maps"), layer = "ne_10m_admin_1_states_provinces_lines")
+
+states <- tidy(states) %>%
+  filter(long >= -105 & long <= -75 & lat >= 17 & lat <= 34) %>%
+  droplevels()
+
+```
+
+Plot map.
+
+```{r fig.height=10.5, fig.width=19, message=FALSE, warning=FALSE}
+
+ggplot() +
+  geom_path(data = map, aes(x = long, y = lat, group = group), color = "black", size = 0.5) +
+  geom_path(data = states, aes(x = long, y = lat, group = group), color = "black", size = 0.5, linetype = "longdash") +
+  geom_path(data = nations, aes(x = long, y = lat, group = group), color = "black", size = 0.75, linetype = "solid") +
+  geom_point(data = slew_sample_data,
+             aes(x = longitude, y = latitude, fill = nursery),
+             shape = 21, size = 5, alpha = 1, show.legend = F) +
+  scale_x_continuous("Longitude", limits = c(-98, -79), breaks = seq(-98, -79, 1)) +
+  scale_y_continuous("Latitude", limits = c(25, 34), breaks = seq(25, 34, 1)) +
+
+  theme_standard
+
+ggsave(here("data", "filter", "slew_nurseries_raw_map.pdf"))
+
+```
+
+# SNP Filtering
+
+Genotyping was executed on the HPC and the first few filtering steps will be executed there too.
+
+## Filter 1: Multiple Criteria
+
+These initial steps include retaining only US individuals, phase SNPs, remove indels, and filter for quality, depth, and minor allele count.
+
+Below is the script called `dDocent_filter_initial.slurm` that is used to do this.
+
+```{bash}
+
+#!/bin/bash
+#SBATCH -J dDocent_filter                   # Name of the job
+#SBATCH -o dDocent_filter.out               # Name of file that will have program output
+#SBATCH -e dDocent_filter.err               # Name of the file that will have job errors, if any
+#SBATCH -N 1                                 # Number of nodes ( the normal cluster partion has 22 total )
+#SBATCH -n 64                                # Number of cores ( my test allocated 2 per node )
+#SBATCH -p normal                            # Partition
+#SBATCH --mail-user=dominic.swift@tamucc.edu
+#SBATCH --mail-type=begin                    # email me when the job starts
+#SBATCH --mail-type=end                      # email me when the job ends
+#SBATCH --time=96:00:00
+
+source /home/dswift/.bashrc
+conda activate ddocent
+
+cd /work/marinegenomics/dswift/Workspace/scalloped_hh/genotype/vcf
+
+vcfsamplenames TotalRawSNPs.vcf > slew_raw.ind
+
+vcftools --vcf TotalRawSNPs.vcf --keep slew_nurseries.ind --out slew_nurseries_raw --recode --recode-INFO-all
+
+vcfallelicprimitives slew_nurseries_raw.recode.vcf --keep-info --keep-geno > slew_nurseries_prim.vcf
+
+vcftools --vcf slew_nurseries_prim.vcf --out slew_nurseries_prim_no_indels --remove-indels --recode --recode-INFO-all
+
+vcftools --vcf slew_nurseries_prim_no_indels.recode.vcf --out slew_f1 --minQ 20 --minGQ 20 --minDP 5 --maxDP 2500 --mac 3 --recode --recode-INFO-all
+
+# keep only inds from top 5 nurseries
+
+vcftools --vcf slew_f1.recode.vcf --keep slew_nurseries.ind --out slew_nurseries_f1 --recode --recode-INFO-all
+
+```
+
+Transfer `slew_f1.recode.vcf` to Earth and produce vcf stats.
+
+```{bash}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+scp dswift@crest-login.tamucc.edu:/work/marinegenomics/dswift/Workspace/scalloped_hh/genotype/vcf/slew_nurseries_f1.recode.vcf .
+
+```
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f1 --depth
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f1 --site-mean-depth
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f1 --missing-indv
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f1 --missing-site
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f1 --het
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f1 --geno-depth
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f1 --singletons
+
+```
+
+Review stats
+
+```{r fig.height=5, fig.width=5,  message=FALSE, warning=FALSE}
+
+slew_sample_data <- read_csv(here("data", "filter", "slew_nurseries_sample_data.csv"))
+
+# Load stats files
+
+ind_stats_slew_f1 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f1") %>%
+  rename(seq_id = INDV) %>%
+  left_join(slew_sample_data)
+
+loci_stats_slew_f1 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f1")
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f1, aes(x = MISS_slew_f1)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  labs(x = "missing data per individual") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f1, aes(x = Fis_slew_f1)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f1, aes(x = MEAN_DEPTH_slew_f1)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Individual") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f1, aes(x = MEAN_DEPTH_slew_f1, y = MISS_slew_f1)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Individual", y = "% Missing Data") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f1, aes(x = MISS_slew_f1)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f1, aes(x = MEAN_DEPTH_slew_f1)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f1, aes(x = MEAN_DEPTH_slew_f1, y = MISS_slew_f1)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+count(ind_stats_slew_f1)
+
+count(loci_stats_slew_f1)
+
+count(distinct(loci_stats_slew_f1, CHR))
+
+```
+
+Plot Fis by lib
+
+```{r fig.height=10, fig.width=5,  message=FALSE, warning=FALSE}
+
+ggplot(ind_stats_slew_f1, aes(x = Fis_slew_f1)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  facet_grid(library ~ .) +
+  theme_standard
+
+fis_lib_f1 <- ind_stats_slew_f1 %>%
+  select(c(seq_id, library, Fis_slew_f1)) %>%
+  spread(key = library, value = Fis_slew_f1)
+
+```
+
+**Kept 550 individuals**
+
+**Kept 123,671 SNPs**
+
+## Filter 2: Missing Data By Individual & SNP
+
+First, remove individuals with > 75% missing data.
+
+```{r}
+
+remove_ind <- ind_stats_slew_f1 %>% 
+  filter(MISS_slew_f1 > 0.75) %>% 
+  select(seq_id) %>% 
+  write_delim(., here("data", "filter", "slew_f1_remove.ind"))
+
+```
+
+Remove individuals with >75% missing data and then loci with genotype call rate <25%
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_nurseries_f1.recode.vcf --out slew_f2a --remove slew_f1_remove.ind --recode --recode-INFO-all
+
+vcftools --vcf slew_f2a.recode.vcf --out slew_f2b --max-missing 0.25 --min-meanDP 10 --recode --recode-INFO-all
+
+vcftools --vcf slew_f2b.recode.vcf --out slew_f2b --missing-indv
+
+```
+ 
+**Kept 541 out of 550 samples**
+
+**Kept 109,243 out of a possible 123,671 SNPs**
+
+Flag individuals with >70% missing data
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# Determine cutoff
+
+imiss <- read_delim(here("data", "filter", "slew_f2b.imiss"), delim = "\t") %>%
+  arrange(desc(F_MISS))
+
+ggplot(imiss, aes(x = F_MISS)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(xintercept = 0.55, color = "red", linetype = "dashed", size = 1) +
+  theme_standard
+
+ind_remove <- imiss %>%
+  filter(F_MISS > 0.55) %>%
+  select(INDV) %>% 
+  write_delim(., here("data", "filter", "slew_f2a_remove.ind"))
+
+```
+
+Remove flagged individuals, then remove loci with genotype call rate <50%.
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f2b.recode.vcf --out slew_f2c --remove slew_f2a_remove.ind --recode --recode-INFO-all
+vcftools --vcf slew_f2c.recode.vcf --out slew_f2d --max-missing 0.5  --recode --recode-INFO-all
+vcftools --vcf slew_f2d.recode.vcf --out slew_f2d --missing-indv
+
+```
+
+Identify individuals with high missing data
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# Determine cutoff
+
+imiss <- read_delim(here("data", "filter", "slew_f2d.imiss"), delim = "\t") %>%
+  arrange(desc(F_MISS))
+
+ggplot(imiss, aes(x = F_MISS)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(xintercept = 0.48, color = "red", linetype = "dashed", size = 1) +
+  theme_standard
+
+ind_remove <- imiss %>%
+  filter(F_MISS > 0.48) %>%
+  select(INDV) %>% 
+  write_delim(., here("data", "filter", "slew_f2d_remove.ind"))
+
+```
+
+Export lists of individuals per library.
+
+```{r}
+
+libs <- slew_sample_data %>% 
+  select(library) %>% 
+  distinct()
+
+libs <- libs$library
+
+for (i in libs) {
+    temp <- slew_sample_data %>%
+      filter(library == i) %>%
+      select(seq_id)
+    
+    path <- glue("lib_{i}.ind")    
+    write_delim(temp, here("data", "filter", path))
+}
+
+```
+
+Remove flagged individuals and generate missing data stats per locus for all libraries
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f2d.recode.vcf --out slew_f2e --remove slew_f2d_remove.ind --recode --recode-INFO-all
+
+ls lib*.ind | cut -f1 -d"." | while read i; do vcftools --vcf slew_f2e.recode.vcf --out $i --keep $i.ind --recode --recode-INFO-all; vcftools --vcf $i.recode.vcf --out $i.ind --missing-site ; done
+
+```
+
+Compare distribution of missing data per locus per library and show the mean proportion of missing data
+
+```{r fig.height=10, fig.width=5, message=FALSE, warning=FALSE}
+
+libs <- slew_sample_data %>% 
+  select(library) %>% 
+  distinct()
+
+libs <- libs$library
+
+loci_missing <- list()
+
+for (i in libs){
+  file <- glue("lib_{i}.ind.lmiss")    
+  loci_missing[[i]] <- read_delim(here("data", "filter", file), delim = "\t") %>% 
+  select(CHR, POS, F_MISS) %>%
+  mutate(lib = i)
+}
+
+loci_missing <- tibble(do.call(rbind, loci_missing))
+
+# plot
+
+ggplot(loci_missing, aes(x = F_MISS)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.25), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Missing Data per Locus") +
+  facet_grid(lib ~ .) +
+  theme_standard
+
+ggsave(here("data", "filter", "slew_loci_missing_lib.png"))
+
+```
+
+Flag loci that were not called in >25% of individuals in a given library.
+
+```{r}
+
+snps <- filter(loci_missing, F_MISS > 0.25) %>%
+  arrange(CHR, POS)
+
+remove_snps <- snps %>%
+  select(CHR, POS) %>%
+  unique()
+
+nrow(remove_snps)
+
+write_delim(remove_snps, here("data", "filter", "slew_f2e_remove.pos"))
+
+```
+
+Remove loci that were not consistently called across all libraries
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f2e.recode.vcf --out slew_f2f --exclude-positions slew_f2e_remove.pos --recode --recode-INFO-all
+vcftools --vcf slew_f2f.recode.vcf --out slew_f2f --missing-indv
+
+```
+
+Identify individuals with high missing data
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# Determine cutoff
+
+imiss <- read_delim(here("data", "filter", "slew_f2f.imiss"), delim = "\t") %>%
+  arrange(desc(F_MISS))
+
+ggplot(imiss, aes(x = F_MISS)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(xintercept = 0.2, color = "red", linetype = "dashed", size = 1) +
+  theme_standard
+
+ind_remove <- imiss %>%
+  filter(F_MISS > 0.2) %>%
+  select(INDV)
+
+write_delim(ind_remove, here("data", "filter", "slew_f2f_remove.ind"))
+
+```
+
+Remove flagged individuals to produce `slew_f1.recode.vcf`. Use `slew_f1e.recode.vcf` to produce stats because SNPs have not been filtered after removing the individuals with high missing data.
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f2f.recode.vcf --out slew_f2 --remove slew_f2f_remove.ind --recode --recode-INFO-all
+
+vcftools --vcf slew_f2.recode.vcf --out slew_f2 --depth
+vcftools --vcf slew_f2.recode.vcf --out slew_f2 --site-mean-depth
+vcftools --vcf slew_f2.recode.vcf --out slew_f2 --missing-indv
+vcftools --vcf slew_f2.recode.vcf --out slew_f2 --missing-site
+vcftools --vcf slew_f2.recode.vcf --out slew_f2 --het
+
+```
+
+Analyze stats post-filtering
+
+```{r fig.height=5, fig.width=5,  message=FALSE, warning=FALSE}
+
+# Load stats files
+
+ind_stats_slew_f2 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f2") %>%
+  rename(seq_id = INDV) %>%
+  left_join(slew_sample_data)
+
+loci_stats_slew_f2 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f2")
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f2, aes(x = MISS_slew_f2)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  labs(x = "missing data per individual") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f2, aes(x = Fis_slew_f2)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f2, aes(x = MEAN_DEPTH_slew_f2)) +
+  geom_histogram(binwidth = 25, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Individual") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f2, aes(x = MEAN_DEPTH_slew_f2, y = MISS_slew_f2)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Individual", y = "% Missing Data") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f2, aes(x = MISS_slew_f2)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f2, aes(x = MEAN_DEPTH_slew_f2)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f2, aes(x = MEAN_DEPTH_slew_f2, y = MISS_slew_f2)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+count(ind_stats_slew_f2)
+
+count(distinct(loci_stats_slew_f2, CHR))
+
+count(loci_stats_slew_f2)
+
+```
+
+Plot Fis by lib
+
+```{r fig.height=10, fig.width=5,  message=FALSE, warning=FALSE}
+
+ggplot(ind_stats_slew_f2, aes(x = Fis_slew_f2)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = mean(Fis_slew_f2, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  facet_grid(library ~ .) +
+  theme_standard
+
+fis_lib_f2 <- ind_stats_slew_f2 %>%
+  select(c(seq_id, library, Fis_slew_f2)) %>%
+  spread(key = library, value = Fis_slew_f2)
+
+```
+
+**Kept 516 out of 541 samples**
+
+**Kept 33,155 out of 109,243 SNPs**
+
+## Filter 3: Depth Among Libraries
+
+Determine mean depth and variance per locus per library
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+ls lib*.ind | cut -f1 -d"." | while read i; do vcftools --vcf slew_f2.recode.vcf --out $i --keep $i.ind  --recode --recode-INFO-all; vcftools --vcf $i.recode.vcf --out $i.ind --site-mean-depth ; done
+
+```
+
+Compare distribution of depth coverage per locus per library. Identify loci that have low coverage in a given library (compared to other libraries)
+
+```{r fig.height=15, fig.width=5, message=FALSE, warning=FALSE}
+
+libs <- slew_sample_data %>% 
+  select(library) %>% 
+  distinct()
+
+libs <- libs$library
+
+loci_depth <- list()
+
+for (i in libs){
+  file <- glue("lib_{i}.ind.ldepth.mean")    
+  loci_depth[[i]] <- read_delim(here("data", "filter", file), delim = "\t") %>% 
+  mutate(lib = i)
+}
+
+loci_depth <- tibble(do.call(rbind, loci_depth))
+
+# plot
+
+ggplot(loci_depth, aes(x = MEAN_DEPTH)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(xintercept = 20, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth per Site") +
+  facet_grid(lib ~ .) +
+  theme_standard
+
+ggsave(here("data", "filter", "slew_loci_depth_lib.png"))
+
+```
+
+Identify loci with large variance in mean depth across libraries and/or individuals
+
+```{r, message = F}
+
+# Calculate mean depth weighted by lib
+
+depth_comp <- loci_depth %>%
+  group_by(lib) %>%
+  distinct(CHROM, .keep_all = TRUE) %>%
+  select(-POS) %>%
+  ungroup() %>%
+  group_by(CHROM) %>%
+  summarise(MEAN = mean(MEAN_DEPTH),
+  STD = sd(MEAN_DEPTH))
+
+# Mean depth across all individuals
+
+f3_ldepth_mean <- read_delim(here("data", "filter", "slew_f2.ldepth.mean"), delim = "\t")  %>%
+  distinct(CHROM, .keep_all = TRUE) %>%
+  select(-POS) %>%
+  mutate(STD_DEPTH = sqrt(VAR_DEPTH))
+
+# Calculate coefficient of variation
+
+depth_summary <- left_join(depth_comp, f3_ldepth_mean, by = "CHROM") %>%
+  mutate(COEFF_VAR_LIB = STD/MEAN*100, COEFF_VAR_IND = STD_DEPTH/MEAN_DEPTH*100) %>% 
+  mutate(ratio = MEAN/MEAN_DEPTH)
+
+```
+
+Compare mean depth across all individuals to mean depth weighted by library, and standard deviation of mean depth across all individuals to sd of mean depth per library (linear regression (w/95% CI)).
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(depth_summary, aes(x = MEAN_DEPTH, y = MEAN)) +
+  geom_point(shape = 1) +
+  labs(x = "Mean Depth, All Inds", y = "Mean Depth Weighted By Library") +
+  geom_abline(slope = 1, linetype = "dashed", color = "red", size = 1) +
+  geom_vline(xintercept = 20, color = "red", linetype = "dashed", size = 1) +
+ # geom_vline(xintercept = 400, color = "red", linetype = "dashed", size = 1) +
+  theme_standard
+
+ggplot(depth_summary, aes(x = STD_DEPTH, y = STD)) +
+  geom_point(shape = 1) +
+  geom_abline(slope = 1, linetype = "dashed", color = "red", size = 1) +
+  xlim(c(0, 500)) +
+  ylim(c(0, 500)) +
+  labs(x = "STD of Mean Depth, Inds", y = "STD of Mean Depth Per Library") +
+  theme_standard
+
+ggplot(depth_summary, aes(x = COEFF_VAR_IND)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "grey") +
+  geom_vline(xintercept = quantile(depth_summary$COEFF_VAR_IND, 0.95, na.rm = TRUE), 
+             color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Depth Coefficient of Variance, All Inds") +
+  theme_standard
+
+ggplot(depth_summary, aes(x = COEFF_VAR_LIB)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "grey") +
+  geom_vline(xintercept = quantile(depth_summary$COEFF_VAR_LIB, 0.95, na.rm = TRUE), 
+             color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Depth Coefficient of Variance Per Library") +
+  theme_standard
+
+# stats
+
+quantile(depth_summary$COEFF_VAR_IND, 0.95, na.rm = TRUE)
+
+quantile(depth_summary$COEFF_VAR_LIB, 0.95, na.rm = TRUE)
+
+```
+
+Flag loci that have high variation in coverage between individuals and between libraries
+
+```{r}
+
+# ind
+
+contigs_var_ind <- depth_summary %>%
+  filter(COEFF_VAR_IND > 125)
+
+# lib 
+
+contigs_var_lib <- depth_summary %>%
+  filter(COEFF_VAR_LIB > 75)
+
+# both (or)
+
+contigs_var <- depth_summary %>%
+  filter(COEFF_VAR_IND > 125 | COEFF_VAR_LIB > 75)
+
+snps_var <- filter(loci_depth, CHROM %in% contigs_var$CHROM) %>%
+  write_delim(., here("data", "filter", "slew_f3_remove.pos"))
+
+```
+
+Remove SNPs with high variation in coverage
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f2.recode.vcf --out slew_f3 --exclude-positions slew_f3_remove.pos --recode --recode-INFO-all
+
+vcftools --vcf slew_f3.recode.vcf --out slew_f3 --depth
+vcftools --vcf slew_f3.recode.vcf --out slew_f3 --site-mean-depth
+vcftools --vcf slew_f3.recode.vcf --out slew_f3 --missing-indv
+vcftools --vcf slew_f3.recode.vcf --out slew_f3 --missing-site
+vcftools --vcf slew_f3.recode.vcf --out slew_f3 --het
+
+```
+
+Analyze stats post-filtering
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# Load stats files
+
+ind_stats_slew_f3 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f3") %>%
+  rename(seq_id = INDV) %>%
+  left_join(slew_sample_data)
+
+loci_stats_slew_f3 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f3")
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f3, aes(x = MISS_slew_f3)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  labs(x = "missing data per individual") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f3, aes(x = Fis_slew_f3)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f3, aes(x = MEAN_DEPTH_slew_f3)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Individual") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f3, aes(x = MEAN_DEPTH_slew_f3, y = MISS_slew_f3)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Individual", y = "% Missing Data") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f3, aes(x = MISS_slew_f3)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f3, aes(x = MEAN_DEPTH_slew_f3)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f3, aes(x = MEAN_DEPTH_slew_f3, y = MISS_slew_f3)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+count(ind_stats_slew_f3)
+
+count(distinct(loci_stats_slew_f3, CHR))
+
+count(loci_stats_slew_f3)
+
+```
+
+Plot Fis by lib
+
+```{r fig.height=10, fig.width=5,  message=FALSE, warning=FALSE}
+
+ggplot(ind_stats_slew_f3, aes(x = Fis_slew_f3)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  facet_grid(library ~ .) +
+  theme_standard
+
+fis_lib_f3 <- ind_stats_slew_f3 %>%
+  select(c(seq_id, library, Fis_slew_f3)) %>%
+  spread(key = library, value = Fis_slew_f3)
+
+```
+
+**Kept 516 out of 516 samples**
+
+**Kept 33,007 out of a possible 33,155 SNPs**
+
+## Filter 4: Minimum Depth and Missing Data by SNP I
+
+Remove loci with minimum mean depth across all individuals < 10 and genotype call rate of <75%
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f3.recode.vcf --out slew_f4 --min-meanDP 20 --max-missing 0.9 --recode --recode-INFO-all
+
+# Query stats
+
+vcftools --vcf slew_f4.recode.vcf --out slew_f4 --depth
+vcftools --vcf slew_f4.recode.vcf --out slew_f4 --site-mean-depth
+vcftools --vcf slew_f4.recode.vcf --out slew_f4 --missing-indv
+vcftools --vcf slew_f4.recode.vcf --out slew_f4 --missing-site
+vcftools --vcf slew_f4.recode.vcf --out slew_f4 --het
+
+```
+
+Analyze stats post-filtering
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# Load stats files
+
+ind_stats_slew_f4 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f4") %>%
+  rename(seq_id = INDV) %>%
+  left_join(slew_sample_data)
+
+loci_stats_slew_f4 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f4")
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f4, aes(x = MISS_slew_f4)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  labs(x = "missing data per individual") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f4, aes(x = Fis_slew_f4)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f4, aes(x = MEAN_DEPTH_slew_f4)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Individual") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f4, aes(x = MEAN_DEPTH_slew_f4, y = MISS_slew_f4)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Individual", y = "% Missing Data") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f4, aes(x = MISS_slew_f4)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f4, aes(x = MEAN_DEPTH_slew_f4)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f4, aes(x = MEAN_DEPTH_slew_f4, y = MISS_slew_f4)) +
+  geom_point(shape = 1) +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+# Plot no of SNPs per locus
+
+loci_stats_slew_f4 %>%
+  count(CHR) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") + 
+  labs(x = "Number of SNPs per Locus") +
+  theme_standard
+
+temp <- loci_stats_slew_f4 %>%
+count(CHR)
+
+# Plot number of SNPs per contig vs. mean depth
+
+left_join(temp, loci_stats_slew_f4) %>%
+  ggplot() +
+  geom_point(aes(x = n, y = MEAN_DEPTH_slew_f4)) +
+  labs(x = "Number of SNPs per Contig", y = "Mean Depth") +
+  theme_standard
+
+count(ind_stats_slew_f4)
+
+count(distinct(loci_stats_slew_f4, CHR))
+
+count(loci_stats_slew_f4)
+
+```
+
+Plot Fis by lib
+
+```{r fig.height=10, fig.width=5,  message=FALSE, warning=FALSE}
+
+ggplot(ind_stats_slew_f4, aes(x = Fis_slew_f4)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = mean(Fis_slew_f4, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  facet_grid(library ~ .) +
+  theme_standard
+
+fis_lib_f4 <- ind_stats_slew_f4 %>%
+  select(c(seq_id, library, Fis_slew_f4)) %>%
+  spread(key = library, value = Fis_slew_f4)
+
+```
+
+**Kept 516 out of 516 samples**
+
+**Kept 32,673 out of a possible 33,007 SNPs**
+
+## Filter 5: Allele Balance
+
+Allele balance (AB) at heterozygous sites: a number between 0 and 1 representing the ratio of reads showing the reference allele to all reads, considering only reads from individuals called as heterozygous
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+cut -f8 slew_f4.recode.vcf | grep -oe "AB=[[:digit:]].[[:digit:]][[:digit:]][[:digit:]]" | sed -s 's/AB=//g' > slew_f4.AB
+
+```
+
+Allele balance is the ratio of reads for reference allele to all reads, considering only reads from individuals called as heterozygous. Values range from 0 - 1; allele balance (for real loci) should be approx. 0.5
+
+Filter contigs SNPs with allele balance < 0.25 and > 0.75
+
+```{r message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+allele_balance <- read_delim(here("data", "filter", "slew_f4.AB"), delim = "\t", col_names = "ab")
+
+# plot
+
+ggplot(allele_balance, aes(x = ab)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(xintercept = 0.1, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 0.4, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 0.6, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 0.9, color = "red", linetype = "dashed") +
+  theme_standard
+
+ggsave(here("data", "filter", "slew_allele_balance.png"))
+
+```
+
+Filter contigs with SNP calls with AB > 0.2, AB > 0.8; retain loci very close to 0 (retain loci that are fixed variants)
+
+Remove genotypes if the quality sum of the reference or alternate allele was 0
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcffilter -s -f "AB > 0.4 & AB < 0.6 | AB < 0.1 | AB > 0.9" -s -g "QR > 0 | QA > 0" slew_f4.recode.vcf > slew_f5.vcf 
+mawk '!/#/' slew_f5.vcf | wc -l
+  
+```
+
+Remaining SNPs: 22,211
+
+## Filter 6: Mapping Quality
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+  
+cut -f8 slew_f5.vcf | grep -oe "MQM=[0-9]*" | sed -s 's/MQM=//g' > slew_f6.MQM
+
+cut -f8 slew_f5.vcf | grep -oe "MQMR=[0-9]*" | sed -s 's/MQMR=//g' > slew_f6.MQMR
+
+```
+
+Remove loci based on ratio of mapping quality for reference and alternate allele, i.e. sites that have a high discrepancy between the mapping qualities of two alleles
+
+```{r message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+mqm <- read_delim(here("data", "filter", "slew_f6.MQM"), delim = "\t", col_names = "MQM")
+
+mqmr <- read_delim(here("data", "filter", "slew_f6.MQMR"), delim = "\t", col_names = "MQMR")
+
+mapqual <- bind_cols(mqmr, mqm) %>%
+  mutate(ratio = MQM/MQMR)
+
+remove_loci <- mapqual %>%
+  filter(ratio < 0.25 | ratio > 1.75)
+
+ggplot(mapqual, aes(x = MQM, y = MQMR)) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, size = 1, color = "red", linetype = "dashed") +
+  geom_abline(intercept = 0, slope = 1/0.25, size = 1, color = "darkblue", linetype = "dashed") +
+  geom_abline(intercept = 0, slope = 1/1.75, size = 1, color = "darkblue", linetype = "dashed") +
+  geom_point(data = remove_loci, aes(x = MQM, y = MQMR), color = "red") +
+  scale_x_continuous(limits = c(0, 100)) +
+  scale_y_continuous(limits = c(0, 100)) +
+  theme_standard
+
+```
+
+Filter loci with mapping quality ratio < 0.25 and > 1.75
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+  
+vcffilter -s -f "MQM / MQMR > 0.25 & MQM / MQMR < 1.75" slew_f5.vcf > slew_f6.vcf
+
+mawk '!/#/' slew_f6.vcf | wc -l
+
+```
+
+Remaining SNPs: 22,211
+
+## Filter 7: Strand Balance
+
+SRF: Number of reference observations on the forward strand
+SAF: Number of alternate observations on the forward strand
+SRR: Number of reference observations on the reverse strand
+SAR: Number of alternate observations on the reverse strand
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter/
+  
+cut -f8 slew_f6.vcf | grep -oe "SAF=[0-9]*" | sed -s 's/SAF=//g' > slew_f6.SAF
+
+cut -f8 slew_f6.vcf | grep -oe "SAR=[0-9]*" | sed -s 's/SAR=//g' > slew_f6.SAR
+
+cut -f8 slew_f6.vcf | grep -oe "SRF=[0-9]*" | sed -s 's/SRF=//g' > slew_f6.SRF
+
+cut -f8 slew_f6.vcf | grep -oe "SRR=[0-9]*" | sed -s 's/SRR=//g' > slew_f6.SRR
+
+```
+
+Paired end reads should not overlap, and a SNP site should only be covered by either the forward or reverse read
+
+```{r message=FALSE, warning=FALSE,  fig.height=5, fig.width=5}
+
+SAF <- read_delim(here("data", "filter", "slew_f6.SAF"), delim = "\t", col_names = "SAF")
+
+SAR <- read_delim(here("data", "filter", "slew_f6.SAR"), delim = "\t", col_names = "SAR")
+
+strands_alt <- bind_cols(SAF, SAR)
+
+SRF <- read_delim(here("data", "filter", "slew_f6.SRF"), delim = "\t", col_names = "SRF")
+
+SRR <- read_delim(here("data", "filter", "slew_f6.SRR"), delim = "\t", col_names = "SRR")
+
+strands_ref <- bind_cols(SRF, SRR)
+
+strands <- bind_cols(strands_alt, strands_ref) %>%
+  mutate(ratioA = SAF/SAR, ratioR = SRF/SRR)
+
+# plot
+
+ggplot(strands, aes(x = SAF, y = SAR)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 0.1, color = "red", linetype = "dashed", size = 1) +
+  geom_abline(intercept = 0, slope = 100, color = "red", linetype = "dashed", size = 1) +
+  theme_standard
+
+```
+
+Remove SNP sites that have > 100x more forward alternate reads than reverse alternate reads and > 100x more forward reverse reads than reverse alternate reads
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+  
+vcffilter -f "SAF / SAR > 100 & SRF / SRR > 100 | SAR / SAF > 100 & SRR / SRF > 100" -s slew_f6.vcf > slew_f7.vcf
+
+mawk '!/#/' slew_f7.vcf | wc -l
+
+```
+
+Number of SNPs remaining: 21,092
+
+## Filter 8: Properly Paired Status
+
+PAIRED: Proportion of observed alternate alleles which are supported by properly paired read fragments
+PAIREDR: Proportion of observed reference alleles which are supported by properly paired read fragments
+
+Identify loci with only unpaired reads mapping to them - an artifact introduced due to de novo reference assembly
+
+Compare number of paired reads mapping the reference and the alternate alleles to identify discrepancy in the paired status for reads supporting reference and alternate alleles
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+  
+vcffilter -f "PAIRED > 0.05 & PAIREDR > 0.05 & PAIREDR / PAIRED < 1.75 & PAIREDR / PAIRED > 0.25 | PAIRED < 0.05 & PAIREDR < 0.05" -s slew_f7.vcf > slew_f8.vcf
+
+mawk '!/#/' slew_f8.vcf | wc -l
+
+```
+
+Number of SNPs remaining: 21,092
+
+## Filter 9: Maximum Depth & Quality
+
+Identify distribution of depth (based on original data set) to identify loci with excess coverage
+
+Original number of individuals in data set is `r nrow(ind_raw_stats)` (INFO flags in filtered data set are are based on original number of individuals in data set)
+
+Create file with the original site depth and quality score for each site
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+  
+# Site depth
+  
+cut -f8 slew_f8.vcf | grep -oe "DP=[0-9]*" | sed -s 's/DP=//g' > slew_f8.depth
+
+# Quality score
+
+mawk '!/#/' slew_f8.vcf | cut -f1,2,6 > slew_f8.loci.qual
+
+```
+
+Calculate average depth and standard deviation
+
+```{r message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+# Depth
+
+depth <- read_delim(here("data", "filter", "slew_f8.depth"), delim = "\t", col_names = "depth")
+
+# Quality score
+
+qual <- read_delim(here("data", "filter", "slew_f8.loci.qual"), delim = "\t", col_names = c("locus", "pos", "qual"))
+
+# Mean depth
+
+mean_depth <- mean(depth$depth)
+
+# Standard deviation
+
+std <- sd(depth$depth)
+
+# Calculate cutoff
+
+cutoff <- sum(mean_depth + (1*std))
+
+# Identify SNPs with excess depth (i.e. > mean depth + 1 standard deviation and quality score < 2x the depth at that site)
+
+df <- bind_cols(qual, depth) %>%
+  mutate(qualcutoff = 2*depth)
+
+remove_snps <- df %>%
+  filter(depth > cutoff) %>%
+  filter(qual < 2*depth)
+
+# Plot
+
+ggplot(df, aes(x = depth, y = qual)) +
+  geom_point() +
+  geom_point(data = remove_snps, aes(x = depth, y = qual), color = "red") +
+  geom_line(data = df, aes(x = depth, y = qualcutoff), color = "red",  linetype = "dashed", size = 1) +
+  geom_vline(xintercept = cutoff, color = "red", linetype = "dashed", size = 1) +
+  theme_standard
+
+remove_snps <- remove_snps %>%
+  select(locus, pos) %>% 
+  write_delim(., here("data", "filter", "slew_f8_remove.pos"))
+
+```
+
+Mean depth per locus (across all individuals) is `r mean_depth` and the standard deviation is `r std` 
+
+Filter SNP site with depth > mean depth + 1 standard deviation = `r sum(mean_depth + 2*std)` and that have quality scores < 2x the depth at that site and output depth per site
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f8.vcf --exclude-positions slew_f8_remove.pos --recode --recode-INFO-all --out slew_f8a
+
+vcftools --vcf slew_f8a.recode.vcf --out slew_f8a --site-mean-depth
+
+```
+
+Compare the distribution of mean depth per site averaged across individuals to determine cut-off value of sites with excessively high depth indicative of paralogs/multicopy loci
+
+```{r message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+# Calculate mean depth per site
+
+f8a_ldepth_mean <- read_delim(here("data", "filter", "slew_f8a.ldepth.mean"), delim = "\t")
+
+ggplot(f8a_ldepth_mean, aes(x = MEAN_DEPTH)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = quantile(MEAN_DEPTH, 0.95)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 170, color = "red", linetype = "solid", size = 1) +
+  labs(x = "Mean Depth Per Site") +
+  theme_standard
+
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+```
+
+Cut-off for maximum mean read depth = 170
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f8a.recode.vcf --out slew_f9 --max-meanDP 170 --recode --recode-INFO-all 
+
+vcftools --vcf slew_f9.recode.vcf --out slew_f9 --depth
+vcftools --vcf slew_f9.recode.vcf --out slew_f9 --site-mean-depth
+vcftools --vcf slew_f9.recode.vcf --out slew_f9 --missing-indv
+vcftools --vcf slew_f9.recode.vcf --out slew_f9 --missing-site
+vcftools --vcf slew_f9.recode.vcf --out slew_f9 --het
+
+```
+
+Analyze stats post-filtering
+
+```{r message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+# Load stats files
+
+ind_stats_slew_f9 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f9") %>%
+  rename(seq_id = INDV) %>%
+  left_join(slew_sample_data)
+
+loci_stats_slew_f9 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f9")
+
+# count
+
+count(ind_stats_slew_f9)
+
+count(distinct(loci_stats_slew_f9, CHR))
+
+count(loci_stats_slew_f9)
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f9, aes(x = MISS_slew_f9)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Missing Data Per Ind") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f9, aes(x = MEAN_DEPTH_slew_f9)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Ind") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f9, aes(x = MEAN_DEPTH_slew_f9, y = MISS_slew_f9)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Ind", y = "% Missing Data") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f9, aes(x = Fis_slew_f9)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f9, aes(x = MISS_slew_f9)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f9, aes(x = MEAN_DEPTH_slew_f9)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f9, aes(x = MEAN_DEPTH_slew_f9, y = MISS_slew_f9)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+# Plot no of SNPs per locus
+
+loci_stats_slew_f9 %>%
+  count(CHR) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") + 
+  labs(x = "Number of SNPs per Locus") +
+  theme_standard
+
+temp <- loci_stats_slew_f9 %>%
+  count(CHR)
+
+# Plot number of SNPs per contig vs. mean depth
+
+left_join(temp, loci_stats_slew_f9) %>%
+  ggplot() +
+  geom_point(aes(x = n, y = MEAN_DEPTH_slew_f9)) +
+  labs(x = "Number of SNPs per Contig", y = "Mean Depth") +
+  theme_standard
+
+```
+
+Plot Fis by lib
+
+```{r fig.height=10, fig.width=5,  message=FALSE, warning=FALSE}
+
+ggplot(ind_stats_slew_f9, aes(x = Fis_slew_f9)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = mean(Fis_slew_f9, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  facet_grid(library ~ .) +
+  theme_standard
+
+fis_lib_f9 <- ind_stats_slew_f9 %>%
+  select(c(seq_id, library, Fis_slew_f9)) %>%
+  spread(key = library, value = Fis_slew_f9)
+
+```
+
+**Kept 516 out of 516 samples**
+
+**Kept 20,631 out of a possible 21,092 SNPs**
+
+## Filter 10: Minimum Depth and Missing Data by SNP II
+
+Remove sample with >10% missing data.
+
+```{r}
+
+remove_ind <- ind_stats_slew_f9 %>% 
+  filter(MISS_slew_f9 > 0.1) %>% 
+  select(seq_id) %>% 
+  write_delim(., here("data", "filter", "remove_f10.ind"), delim = "\t", col_names = F)
+
+```
+
+Assess individuals in terms of low coverage, high missing data, and frequency burden (i.e. distribution of the number of variants within each individual of a specific frequency)
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f9.recode.vcf --out slew_f10a --remove remove_f10.ind --recode --recode-INFO-all
+
+vcftools --vcf slew_f10a.recode.vcf --out slew_f10 --min-meanDP 20 --max-missing 0.9 --recode --recode-INFO-all
+
+vcftools --vcf slew_f10.recode.vcf --out slew_f10 --depth
+vcftools --vcf slew_f10.recode.vcf --out slew_f10 --site-mean-depth
+vcftools --vcf slew_f10.recode.vcf --out slew_f10 --missing-indv
+vcftools --vcf slew_f10.recode.vcf --out slew_f10 --missing-site
+vcftools --vcf slew_f10.recode.vcf --out slew_f10 --het
+vcftools --vcf slew_f10.recode.vcf --out slew_f10 --hardy
+
+```
+
+Analyze stats post-filtering
+
+```{r message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+# Load stats files
+
+ind_stats_slew_f10 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f10") %>%
+  rename(seq_id = INDV) %>%
+  left_join(slew_sample_data)
+
+loci_stats_slew_f10 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f10")
+
+# count
+
+count(ind_stats_slew_f10)
+
+count(distinct(loci_stats_slew_f10, CHR))
+
+count(loci_stats_slew_f10)
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f10, aes(x = MISS_slew_f10)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Missing Data Per Ind") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f10, aes(x = MEAN_DEPTH_slew_f10)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Ind") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f10, aes(x = MEAN_DEPTH_slew_f10, y = MISS_slew_f10)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.10), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Ind", y = "% Missing Data") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f10, aes(x = Fis_slew_f10)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0),color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f10, aes(x = MISS_slew_f10)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f10, aes(x = MEAN_DEPTH_slew_f10)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f10, aes(x = MEAN_DEPTH_slew_f10, y = MISS_slew_f10)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+# Plot no of SNPs per locus
+
+loci_stats_slew_f10 %>%
+  count(CHR) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") + 
+  labs(x = "Number of SNPs per Locus") +
+  theme_standard
+
+temp <- loci_stats_slew_f10 %>%
+  count(CHR)
+
+# Plot number of SNPs per contig vs. mean depth
+
+left_join(temp, loci_stats_slew_f10) %>%
+  ggplot() +
+  geom_point(aes(x = n, y = MEAN_DEPTH_slew_f10)) +
+  labs(x = "Number of SNPs per Contig", y = "Mean Depth") +
+  theme_standard
+
+```
+
+Plot Fis by library
+
+```{r fig.height=10, fig.width=5,  message=FALSE, warning=FALSE}
+
+ggplot(ind_stats_slew_f10, aes(x = Fis_slew_f10)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = mean(Fis_slew_f10, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  facet_grid(library ~ .) +
+  theme_standard
+
+fis_lib_f10 <- ind_stats_slew_f10 %>%
+  select(c(seq_id, library, Fis_slew_f10)) %>%
+  spread(key = library, value = Fis_slew_f10)
+
+```
+
+**Kept 511 out of 516 samples**
+
+**Kept 20,631 out of a possible 20,631 SNPs**
+
+## Filter 11: Remove Individuals With Low Fis
+
+Identify individuals with low Fis and remove. Low Fis (high heterozygosity) is indicative of contamination, although some individuals may be more outbred than others and thus may be informative.
+
+```{r Fis, fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+is_outlier <- function(x) {
+    return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+
+# Detect Fis outliers
+
+is_outlier <- function(x) {
+    return(x < quantile(ind_stats_slew_f10$Fis_slew_f10, 0.25) - 1.5 * IQR(ind_stats_slew_f10$Fis_slew_f10) | ind_stats_slew_f10$Fis_slew_f10 > quantile(ind_stats_slew_f10$Fis_slew_f10, 0.75) + 1.5 * IQR(ind_stats_slew_f10$Fis_slew_f10))
+}
+
+fis_outliers <- tibble(is_outlier(ind_stats_slew_f10$Fis_slew_f10)) %>%
+  rename(fis_outlier = `is_outlier(ind_stats_slew_f10$Fis_slew_f10)`) %>%
+  cbind(ind_stats_slew_f10$seq_id) %>%
+  rename(seq_id = `ind_stats_slew_f10$seq_id`) %>%
+  left_join(ind_stats_slew_f10, ., by = "seq_id") %>%
+  filter(fis_outlier == "TRUE") %>%
+  arrange(Fis_slew_f10) %>% 
+  relocate(fis_outlier, .after = Fis_slew_f10)
+
+# boxplot
+
+ggplot(ind_stats_slew_f10, aes(y=Fis_slew_f10)) + 
+  geom_boxplot(notch = TRUE) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_hline(aes(yintercept = -0.1),
+             color = "darkblue", linetype = "dotted", size = 0.5) +
+  ylim(-1, 1) +
+  theme_standard
+
+# histogram
+
+ggplot(ind_stats_slew_f10, aes(x = Fis_slew_f10)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = quantile(ind_stats_slew_f10$Fis_slew_f10, 0.25) - 1.5 * IQR(ind_stats_slew_f10$Fis_slew_f10)),
+             color = "red", linetype = "dashed", size = 0.5) +
+  geom_vline(aes(xintercept = -0.15), color = "darkblue", linetype = "dotted", size = 0.5) +
+  geom_vline(aes(xintercept = 0.15), color = "darkblue", linetype = "dotted", size = 0.5) +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "solid", size = 0.5) +
+  labs(x = "Fis Per Individual") +
+  xlim(-1, 1) +
+  theme_standard
+
+# write to file
+
+temp <- ind_stats_slew_f10 %>% 
+  filter(Fis_slew_f10 < -0.1) %>% 
+  arrange(Fis_slew_f10) %>% 
+  write_delim(., here("data", "filter", "remove_fis.ind"))
+
+```
+
+## Filter 12: Minimum Depth and Missing Data by SNP III
+
+Remove loci with minimum mean depth across all individuals >15 and genotype call rate of <90%
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f10.recode.vcf --out slew_f11 --remove remove_fis.ind --recode --recode-INFO-all
+
+vcftools --vcf slew_f11.recode.vcf --out slew_f12 --min-meanDP 20 --max-missing 0.9 --recode --recode-INFO-all
+
+# Query stats
+
+vcftools --vcf slew_f12.recode.vcf --out slew_f12 --depth
+vcftools --vcf slew_f12.recode.vcf --out slew_f12 --site-mean-depth
+vcftools --vcf slew_f12.recode.vcf --out slew_f12 --missing-indv
+vcftools --vcf slew_f12.recode.vcf --out slew_f12 --missing-site
+vcftools --vcf slew_f12.recode.vcf --out slew_f12 --het
+vcftools --vcf slew_f12.recode.vcf --out slew_f12 --012
+
+```
+
+Analyze stats post-filtering
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+# Load stats files
+
+ind_stats_slew_f12 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f12") %>%
+  rename(seq_id = INDV) %>%
+  left_join(slew_sample_data)
+
+loci_stats_slew_f12 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f12")
+
+# count
+
+count(ind_stats_slew_f12)
+
+count(distinct(loci_stats_slew_f12, CHR))
+
+count(loci_stats_slew_f12)
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f12, aes(x = MISS_slew_f12)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Missing Data Per Individual") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f12, aes(x = MEAN_DEPTH_slew_f12)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Individual") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f12, aes(x = MEAN_DEPTH_slew_f12, y = MISS_slew_f12)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Individual", y = "% Missing Data") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f12, aes(x = Fis_slew_f12)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f12, aes(x = MISS_slew_f12)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f12, aes(x = MEAN_DEPTH_slew_f12)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f12, aes(x = MEAN_DEPTH_slew_f12, y = MISS_slew_f12)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+# Plot no of SNPs per locus
+
+loci_stats_slew_f12 %>%
+  count(CHR) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") + 
+  labs(x = "Number of SNPs per Locus") +
+  theme_standard
+
+temp <- loci_stats_slew_f12 %>%
+  count(CHR)
+
+# Plot number of SNPs per contig vs. mean depth
+
+left_join(temp, loci_stats_slew_f12) %>%
+  ggplot() +
+  geom_point(aes(x = n, y = MEAN_DEPTH_slew_f12)) +
+  labs(x = "Number of SNPs per Contig", y = "Mean Depth") +
+  theme_standard
+
+```
+
+**Kept 498 out of 511 samples**
+
+**Kept 20,630 out of a possible 20,631 SNPs**
+
+## Filter 13: Library Effects
+
+Use OutFLANK to identify FST outliers by library.
+
+```{r, message=FALSE, warning=FALSE}
+
+# Read 012 format data and eliminate first column
+
+snp_mat <- read_table2(here("data", "filter", "slew_f12.012"), col_names = FALSE) %>%
+  select(-X1)
+
+# Replace -1 with 9 (for missing data)
+
+snp_mat[snp_mat == -1] <- 9
+
+# Convert to an array
+
+snp_mat <- as.matrix(snp_mat)
+
+# Create a vector listing locus names
+
+loc_names <- read_table2(here("data", "filter", "slew_f12.012.pos"), col_names = c("CHROM", "POS")) %>%
+  unite(col = "LOCUS", 1:2, sep = "_", remove = FALSE)
+
+loc_names <- loc_names$LOCUS
+
+# Create a vector with population designations for each individual
+
+slew_sample_data <- read_csv(here("data", "filter", "slew_nurseries_sample_data.csv"))
+
+inds <- read_table2(here("data", "filter", "slew_f12.012.indv"), col_names = "seq_id")
+  
+pop_names <- left_join(inds, slew_sample_data) %>%
+  rename(pop = library) %>% 
+  select(pop)
+
+```
+
+Estimate heterozygosity per locus and calculate F<sub>ST</sub>. 
+
+```{r , message=FALSE, warning=FALSE, output=FALSE}
+
+fst_mat <- MakeDiploidFSTMat(snp_mat, loc_names, pop_names) %>%
+  drop_na(He)
+
+head(fst_mat)
+
+```
+
+Check for loci with low sample sizes or unusual values of uncorrected F<sub>ST</sub>. Look for loci that deviate from the linear relationship in the plots below and remove those loci.
+
+To fit the FST distribution to chi-square, OutFLANK requires the FST uncorrected for sample size (FSTNoCorr). This is a valid approach as long as all loci have equal sample sizes within populations. The effect of correcting for sample size will make the corrected FST estimate (FST) lower than the uncorrected FST estimate (FSTNoCorr). Note that all loci deviate between FST and FSTNoCorr, but OutFLANK assumes that these deviations are the same for each locus. If a locus has a much lower sample size compared to the rest, it could have a broader error distribution (and therefore incorrectly inferred as an outlier).
+
+```{r fig.height=5, fig.width=5}
+
+ggplot(fst_mat, aes(x = FST, y = FSTNoCorr)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, size = 1, color = "red", linetype = "dashed") +
+  labs(x = "FST", y = "Corrected FST") +
+  theme_standard
+
+```
+
+No loci deviate from the linear relationship in the above plots because they were all genotyped in the same number of individuals, thus all loci are retained.
+
+Plot heterozygosity vs. uncorrected FST and histogram of uncorrected FST. 
+
+```{r fig.height=5, fig.width=5}
+
+ggplot(fst_mat, aes(x = He, y = FSTNoCorr)) +
+  geom_point(shape = 1, size = 2) +
+ # scale_y_continuous(limits = c(0, 0.25)) +
+  labs(x = "Heterozygosity", y = "Uncorrected FST per Locus") +
+  theme_standard
+
+ggplot(fst_mat, aes(x = FSTNoCorr)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  #scale_x_continuous(limits = c(0, 0.25)) +
+  labs(x = "Uncorrected FST per Locus, All Loci") +
+  theme_standard
+
+```
+
+Run the `OutFLANK()` function to estimate the parameters on the neutral FST distribution.
+
+```{r, message=FALSE, warning=FALSE}
+
+# Number of spatial locations included in the dataset
+
+n <- length(unique(pop_names))
+
+# Estimate distribution for Sites
+
+outflank <- OutFLANK(fst_mat, n, LeftTrimFraction = 0.05, RightTrimFraction = 0.05,
+                       Hmin = 0.1, qthreshold = 0.05)
+
+```
+
+Check fit by looking at plot, particularly in the right tail.
+
+Also look at p-value histogram. This plots the "right-tailed" p-values, meaning the outliers in the right tail of the FST distribution will have a p-value near zero. We expect the histogram to be flat and maybe have a bump near zero.
+
+```{r fig.height=5, fig.width=5}
+
+OutFLANKResultsPlotter(outflank, withOutliers = TRUE, NoCorr = TRUE, Hmin = 0.1, binwidth = 0.001, Zoom = FALSE, RightZoomFraction = 0.05, titletext = NULL)
+
+hist(outflank$results$pvaluesRightTail)
+
+OutFLANKResultsPlotter(outflank, withOutliers = TRUE, NoCorr = TRUE, Hmin = 0.1, binwidth = 0.001, Zoom = TRUE, RightZoomFraction = 0.1, titletext = NULL)
+
+```
+
+Important values returned by OutFLANK.
+
+```{r}
+
+# Mean FST of loci not flagged as outliers
+
+outflank$FSTbar
+
+# Mean FST of loci not flagged as outliers without sample-size correction
+
+outflank$FSTNoCorrbar
+
+# Inferred df for the chi-square distribution
+
+outflank$dfInferred
+
+# Number of loci flagged as having significantly low FST
+
+outflank$numberLowFstOutliers
+
+# Number of loci flagged as having significantly high FST
+
+outflank$numberHighFstOutliers
+
+# Dataframe of results
+
+temp <- outflank$results
+
+# Check that the number of loci in the input file is the same as the number of loci in the output file
+
+nrow(fst_mat) - nrow(outflank$results)
+
+```
+
+Dataset contains SNPs on the same contig. Group SNP sites by contig to determine the proportion of SNPs on the same contig that are flagged as F<sub>ST</sub> outliers.
+
+```{r fig.height=5, fig.width=5}
+
+results <- outflank$results %>%
+  drop_na() %>%
+  mutate(freq = (1 - meanAlleleFreq)) %>%
+  mutate(MAF = ifelse(meanAlleleFreq > freq, freq, meanAlleleFreq)) 
+
+```
+
+Plot outliers, if present.
+
+```{r fig.height=5, fig.width=5, eval = F}
+
+LocusName <- results %>%
+  group_by(LocusName) %>%
+  count(OutlierFlag) %>%
+  spread(key = OutlierFlag, value = n) %>%
+  rename(OUT = `TRUE`) %>%
+  rename(IN = `FALSE`) %>%
+  replace_na(list(IN = 0, OUT = 0)) %>%
+  mutate(SNPs = IN + OUT, prop_IN = IN/SNPs, prop_OUT = OUT/SNPs)
+
+ggplot(LocusName, aes(x = prop_IN)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkgrey") + 
+  labs(x = "% SNPs Per Contig, Neutral") +
+  theme_standard
+
+ggplot(LocusName, aes(x = prop_OUT)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkgrey") + 
+  labs(x = "% SNPs Per Contig, Outlier") +
+  theme_standard
+
+# Outflank plot
+
+plot(outflank$results$He, outflank$results$FST, pch=20, col="grey")
+    points(outflank$results$He[outflank$results$qvalues<0.01], outflank$results$FST[outflank$results$qvalues<0.01], pch=21, col="blue")
+                                                                                                   
+```
+
+Identify outliers.
+
+```{r, warning=FALSE, message=FALSE, output=FALSE}
+
+outliers <- results %>%
+ filter(qvalues < 0.05)
+
+outflank_outliers <- distinct(outliers, LocusName) %>% 
+ # select(contig, locus) %>% 
+  separate(LocusName, sep = "_", into = c("scaffold", "n", "pilon", "POS"), convert = TRUE) %>% 
+  unite("CHR", c(scaffold, n, pilon), sep = "_", remove = FALSE) %>% 
+  select(CHR, POS) %>% 
+  write_delim(., here("data", "filter", "slew_f13_lib_outliers.txt"), delim = "\t", col_names = F)
+
+```
+
+Use PCA to see library effects patterns.
+
+```{r, eval = F, message = F}
+
+slew_f12_gen <- read.vcfR(file = here("data", "filter", "slew_f12.recode.vcf")) %>% 
+  vcfR2genind()
+
+all_loci <- locNames(slew_f12_gen) %>% 
+  as_tibble_col("locus")
+
+outflank_outliers <- read_delim(here("data", "filter", "slew_f13_lib_outliers.txt"), delim = "\t", col_names = c("CHR", "POS")) %>% 
+  unite(col = "locus", 1:2, sep = "_", remove = T)
+
+neutral_loci <- anti_join(all_loci, outflank_outliers)
+
+slew_outlier.gen <- genind.rem.loci(slew_f12_gen, neutral_loci$locus)
+
+slew_neutral.gen <- genind.rem.loci(slew_f12_gen, outflank_outliers$locus)
+
+```
+
+Run PCA on outlier dataset and plot.
+
+```{r fig.height=6, fig.width=6, message=FALSE, warning=FALSE}
+
+# pca
+
+x <- tab(slew_outlier.gen, freq=TRUE, NA.method="mean")
+
+pca <- dudi.pca(df = x, center = TRUE, scale = FALSE, scannf = FALSE, nf = 10)
+
+eig <- eigenvalues(pca)
+
+pc_inds  <- PC.ind(pca) %>%
+  inner_join(slew_sample_data)
+
+ggplot(pc_inds , aes(x = Axis1, y = Axis2, label = library, fill = library, color = library)) +
+  geom_point(alpha = 0.75, size = 4) +
+  labs(x = paste("PC1:", round(eig[1, 3], digits = 3), "%"), 
+       y = paste("PC2:", round(eig[2, 3], digits = 3), "%")) +
+  #ggtitle("By Region") +
+ # scale_fill_manual(values=region_col) +
+  #scale_color_manual(values=region_col) +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  stat_ellipse(level = 0.95) +
+  guides(fill=guide_legend(nrow=2, byrow=TRUE))
+
+ggsave(here("data", "filter", "slew_lib_outliers_pca_plot.png"))
+
+```
+
+Examine individuals driving patterns
+
+```{r fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+
+# loading plot individuals
+
+ggplot(pc_inds, aes(x = seq_id, y = Loading1, fill = library)) +
+  geom_bar(stat = "identity") +
+  facet_grid(. ~ library, scales = "free") +
+  labs(x = "Individual", y = "Loading Principle Component 1") +
+  theme_standard +
+  theme(axis.text.x = element_blank())
+
+# loading plot individuals
+
+ggplot(pc_inds, aes(x = seq_id, y = Loading2, fill = library)) +
+  geom_bar(stat = "identity") +
+  facet_grid(. ~ library, scales = "free") +
+  labs(x = "Individual", y = "Loading Principle Component 2") +
+  theme_standard +
+  theme(axis.text.x = element_blank())
+
+```
+
+Run PCA on non-outlier dataset and plot.
+
+```{r fig.height=6, fig.width=6, message=FALSE, warning=FALSE}
+
+# pca
+
+x <- tab(slew_neutral.gen, freq=TRUE, NA.method="mean")
+
+pca <- dudi.pca(df = x, center = TRUE, scale = FALSE, scannf = FALSE, nf = 10)
+
+eig <- eigenvalues(pca)
+
+pc_inds  <- PC.ind(pca) %>%
+  inner_join(slew_sample_data)
+
+ggplot(pc_inds , aes(x = Axis1, y = Axis2, label = library, fill = library, color = library)) +
+  geom_point(alpha = 0.75, size = 4) +
+  labs(x = paste("PC1:", round(eig[1, 3], digits = 3), "%"), 
+       y = paste("PC2:", round(eig[2, 3], digits = 3), "%")) +
+  #ggtitle("By Region") +
+ # scale_fill_manual(values=region_col) +
+  #scale_color_manual(values=region_col) +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  stat_ellipse(level = 0.95) +
+  guides(fill=guide_legend(nrow=2, byrow=TRUE))
+
+ggsave(here("data", "filter", "slew_lib_no_outliers_pca_plot.png"))
+
+```
+
+Examine individuals driving patterns
+
+```{r fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+
+# loading plot individuals
+
+ggplot(pc_inds, aes(x = seq_id, y = Loading1, fill = library)) +
+  geom_bar(stat = "identity") +
+  facet_grid(. ~ library, scales = "free") +
+  labs(x = "Individual", y = "Loading Principle Component 1") +
+  theme_standard +
+  theme(axis.text.x = element_blank())
+
+# loading plot individuals
+
+ggplot(pc_inds, aes(x = seq_id, y = Loading2, fill = library)) +
+  geom_bar(stat = "identity") +
+  facet_grid(. ~ library, scales = "free") +
+  labs(x = "Individual", y = "Loading Principle Component 2") +
+  theme_standard +
+  theme(axis.text.x = element_blank())
+
+```
+
+Remove library outliers from vcf.
+
+```{bash}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f12.recode.vcf --out slew_f13 --exclude-positions slew_f13_lib_outliers.txt --recode --recode-INFO-all
+
+```
+
+## Filter 14: Replicates
+
+Estimate relatedness values of duplicate samples
+
+```{r message=FALSE, warning=FALSE, echo = FALSE, eval = FALSE}
+
+slew_f13_gen <- read.vcfR(file = here("data", "filter", "slew_f13.recode.vcf")) %>% 
+  vcfR2genind()
+
+# convert genid to df to be used as genetic input
+
+## for some unknown reason, converting vcf to genind to df means that alleles do not have leading zeros
+
+slew_df <- genind2df(slew_f13_gen, usepop = FALSE, oneColPerAll = TRUE) %>%
+  mutate_all(funs(paste0("00", .))) %>%  # ADD LEADING ZEROS
+  mutate_all(str_replace, "003", "004") %>% # RECODE
+  mutate_all(str_replace, "002", "003") %>% # RECODE
+  mutate_all(str_replace, "001", "002") %>% # RECODE
+  mutate_all(str_replace, "000", "001") %>% # RECODE
+  mutate_all(funs(na_if(., "00NA"))) %>% 
+  rownames_to_column("seq_id") %>% 
+  write_delim(., here("data", "filter", "slew_dupe.input"), col_names = FALSE, delim = "\t")
+
+genotypedata <- readgenotypedata(here("data", "filter", "slew_dupe.input"))
+
+related <- coancestry(genotypedata$gdata, dyadml = 1)
+
+related <- related$relatedness
+
+write_csv(related, here("data", "filter", "slew_dupe.output"))
+
+rm(related)
+rm(genotypedata)
+
+```
+
+Results.
+
+```{r message=FALSE, warning=FALSE, echo = FALSE, fig.height=5, fig.width=5}
+
+# find duplicates and recaptures
+
+dupes_related <- read_csv(here("data", "filter", "slew_dupe.output"))
+
+dupes1 <- dupes_related %>%
+  select(pair.no, ind1.id, ind2.id, dyadml) %>%
+  rename(seq_id = ind1.id) %>%
+  left_join(., slew_sample_data) %>%
+  select(c(seq_id, sex, nursery, dyadml))
+
+dupes2 <- dupes_related %>%
+  select(ind2.id) %>%
+  rename(seq_id = ind2.id) %>%
+  left_join(slew_sample_data) %>%
+  select(c(seq_id, sex, nursery)) %>%
+  rename(seq_id_2 = seq_id) %>%
+  rename(sex_2 = sex) %>%
+  rename(nursery_2 = nursery)
+
+dupes_related <- cbind(dupes1, dupes2) %>%
+  mutate(across(dyadml, round, 2)) %>% 
+  arrange(desc(dyadml)) %>% 
+  write_csv(., here("data", "filter", "slew_dupe_related.csv"))
+
+# find duplicates based on relatedness values > 0.9
+
+dupes <- dupes_related %>%
+  filter(dyadml > 0.9) %>% 
+  write_csv(., here("data", "filter", "slew_dupes.csv"))
+
+# Find 'suspect dupes', i.e. other dupes but from different sites
+
+suspect_dupes <- dupes %>% 
+  filter(nursery != nursery_2 | sex != sex_2)
+
+### there are none ###
+
+ggplot(dupes, aes(x = dyadml)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = mean(dyadml)), color = "darkblue", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.9), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Relatedness", y = "Number of Pairs") +
+  ggtitle("Duplicates") +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Compare genotypes between duplicates
+
+```{r, fig.height=5, fig.width=5}
+
+slew_f13_gen <- read.vcfR(file = here("data", "filter", "slew_f13.recode.vcf")) %>% 
+  vcfR2genind()
+
+slew_df <- genind2df(slew_f13_gen, usepop = TRUE, oneColPerAll = TRUE, sep = ":") %>%
+  mutate_all(funs(paste0("00", .))) %>%  # ADD LEADING ZEROS
+  mutate_all(str_replace, "003", "004") %>% # RECODE
+  mutate_all(str_replace, "002", "003") %>% # RECODE
+  mutate_all(str_replace, "001", "002") %>% # RECODE
+  mutate_all(str_replace, "000", "001") %>% # RECODE
+  mutate_all(funs(na_if(., "00NA"))) %>%
+  rownames_to_column()
+
+genolist = list()
+
+for (i in rownames(dupes)) {
+    # ... make some data
+    geno <- slew_df %>%
+      filter(rowname %in% dupes[i,]) %>%
+      select(-rowname) %>%
+      rownames_to_column %>% 
+      gather(LOCUS, value, -rowname) %>% 
+      spread(rowname, value) %>%
+      rename(Ind1 = "1", Ind2 = "2")
+    
+    geno$i <- i  # keep track of which iteration produced it
+    genolist[[i]] <- geno # add it to your list
+}
+
+geno_error = do.call(rbind, genolist) %>%
+  filter(Ind1 != Ind2) %>% 
+  separate(LOCUS, sep = "[.]", into = c("locus", "allele"), convert = TRUE) %>% 
+  select(-allele)
+
+# genoerrors per pair
+
+geno_error_pair <- count(geno_error, i) %>%
+  arrange(desc(n))
+
+# compare loci affected by genotyping error
+
+geno_error_locus <- geno_error %>% 
+  group_by(locus) %>% 
+  count()
+
+ggplot(geno_error_locus, aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+  labs(x = "Number of Genotyping Errors Per Locus") +
+  theme_standard
+
+```
+
+Export lists of replicate individuals and loci with systematic differences among replicates that will be removed.
+
+```{r, fig.height=5, fig.width=5}
+
+remove_ind <- dupes %>%
+  select(seq_id) %>% 
+  distinct() %>% 
+  write_delim(., here("data", "filter", "slew_rep.ind"), col_names = F)
+
+remove_loci <- filter(geno_error_locus, n > 1) %>% 
+  separate(locus, sep = "_", into = c("a", "b", "c", "snp"), convert = TRUE) %>%
+  unite("contig", c(a, b, c), sep = "_", remove = FALSE) %>% 
+  select(contig, snp) %>% 
+  write_delim(., here("data", "filter", "slew_rep_fail.loci"), col_names = F)
+
+```
+
+Remove replicate samples and loci with systematic differences among replicate samples from vcf.
+
+```{bash}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/filter
+
+vcftools --vcf slew_f13.recode.vcf --out slew_f14a --remove slew_rep.ind --recode --recode-INFO-all
+
+vcftools --vcf slew_f14a.recode.vcf --out slew_f14 --exclude-positions slew_rep_fail.loci --recode --recode-INFO-all
+
+# Query stats
+
+vcftools --vcf slew_f14.recode.vcf --out slew_f14 --depth
+vcftools --vcf slew_f14.recode.vcf --out slew_f14 --site-mean-depth
+vcftools --vcf slew_f14.recode.vcf --out slew_f14 --missing-indv
+vcftools --vcf slew_f14.recode.vcf --out slew_f14 --missing-site
+vcftools --vcf slew_f14.recode.vcf --out slew_f14 --het
+
+```
+
+Analyze stats post-filtering
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+# Load stats files
+
+ind_stats_slew_f14 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f14") %>%
+  rename(seq_id = INDV) %>% 
+  left_join(slew_sample_data)
+
+loci_stats_slew_f14 <- read.loc.stats(dir = here("data", "filter"), vcf = "slew_f14")
+
+# count
+
+count(ind_stats_slew_f14)
+
+count(distinct(loci_stats_slew_f14, CHR))
+
+count(loci_stats_slew_f14)
+
+# Plot missing data per individual
+
+ggplot(ind_stats_slew_f14, aes(x = MISS_slew_f14)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Missing Data Per Individual") +
+  theme_standard
+
+# Plot read depth per individual
+
+ggplot(ind_stats_slew_f14, aes(x = MEAN_DEPTH_slew_f14)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Individual") +
+  theme_standard
+
+# Plot depth vs missing
+
+ggplot(ind_stats_slew_f14, aes(x = MEAN_DEPTH_slew_f14, y = MISS_slew_f14)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Individual", y = "% Missing Data") +
+  theme_standard
+
+# Plot Fis per individual
+
+ggplot(ind_stats_slew_f14, aes(x = Fis_slew_f14)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Fis Per Individual") +
+  theme_standard
+
+# Plot distribution missing data per locus
+
+ggplot(loci_stats_slew_f14, aes(x = MISS_slew_f14)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "% Missing Data Per Locus") +
+  theme_standard
+
+# Plot distribution mean read depth
+
+ggplot(loci_stats_slew_f14, aes(x = MEAN_DEPTH_slew_f14)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Read Depth Per Locus") +
+  theme_standard
+
+# Plot read depth vs missing data
+
+ggplot(loci_stats_slew_f14, aes(x = MEAN_DEPTH_slew_f14, y = MISS_slew_f14)) +
+  geom_point() +
+  geom_vline(aes(xintercept = 20), color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Mean Depth Per Locus", y = "% Missing Data") +
+  theme_standard
+
+# Plot no of SNPs per locus
+
+loci_stats_slew_f14 %>%
+  count(CHR) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") + 
+  labs(x = "Number of SNPs per Locus") +
+  theme_standard
+
+temp <- loci_stats_slew_f14 %>%
+  count(CHR)
+
+# Plot number of SNPs per contig vs. mean depth
+
+left_join(temp, loci_stats_slew_f14) %>%
+  ggplot() +
+  geom_point(aes(x = n, y = MEAN_DEPTH_slew_f14)) +
+  labs(x = "Number of SNPs per Contig", y = "Mean Depth") +
+  theme_standard
+
+```
+
+**Kept 472 out of 671 samples**
+
+**Kept 19961 out of a possible 17,834 SNPs**
+
+# Map Remaining Samples
+
+```{r message=FALSE}
+
+ind_stats_slew_f14 <- read.ind.stats(dir = here("data", "filter"), vcf = "slew_f14") %>%
+  rename(seq_id = INDV) %>% 
+  left_join(slew_sample_data)
+
+count(ind_stats_slew_f14, nursery) %>% 
+  arrange(desc(n))
+
+keep_inds <- ind_stats_slew_f14 %>% 
+  write_delim(., here("data", "filter", "keep_nurseries.ind"), delim = "\t", col_names = F)
+
+keep_nurseries <- unique(keep_inds$nursery)
+
+cols <- brewer.pal(length(keep_nurseries), "Set3")    # 12 distinct colors
+cols <- c(cols)        # add a 13th if needed
+
+pal <- colorFactor(
+  palette = cols,
+  domain = keep_nurseries
+)
+
+leaflet(data = keep_inds) %>%
+  addProviderTiles("Esri.WorldImagery") %>%
+  addCircleMarkers(
+    lng = ~longitude, lat = ~latitude,
+    color = "black",
+    fillColor = ~pal(nursery),   # <--- use pal() not cols()
+    fillOpacity = 0.8,
+    radius = 6,
+    stroke = TRUE,
+    weight = 1,
+    label = ~seq_id
+  ) %>%
+  addLegend(
+    position = "topright",
+    pal = pal,                   # <--- also pal here
+    values = ~nursery,
+    title = "nursery"
+  )
+
+# how many inds per nursery now?
+
+keep_inds %>% 
+  count(nursery) %>% 
+  arrange(desc(n))
+
+```
+
+# Haplotype
+
+Produce haplotypes using `rad haplotyper` for the individuals retained.
+
+```{bash, eval=FALSE}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/haplotype
+
+vcftools --vcf ../filter/slew_f14.recode.vcf --keep ../filter/keep_nurseries.ind --out slew_pre_hap --recode --recode-INFO-all
+
+vcfsamplenames slew_pre_hap.recode.vcf > slew_hap.ind
+
+```
+
+Use `slew_hap.ind` to create `popmap` as a tab-separated file of individuals and their population designation, with one individual per line
+
+This file is needed to write the genepop file, if not provided the script will run through the process but not write a genepop file and place into same folder `rad_haplotyper.pl` will be run from
+
+```{r, message = F}
+
+# produce popmap
+
+slew_sample_data <- read_csv(here("data", "filter", "slew_nurseries_sample_data.csv"))
+
+popmap <- read_delim(here("data", "haplotype", "slew_hap.ind"), delim = "\t", col_names = "seq_id") %>%
+  left_join(slew_sample_data) %>%
+  select(c(seq_id, nursery)) %>%
+  write_delim(., here("data", "haplotype", "popmap"), delim = "\t", col_names = F)
+
+pop_inds <- popmap %>% 
+  select(seq_id) %>% 
+  write_delim(., here("data", "haplotype", "popmap.ind"), delim = "\t", col_names = F)
+
+count(popmap, nursery) %>%
+  arrange(desc(n))
+
+```
+
+Copy files from `earth` to `crest`.
+
+```{bash, eval=FALSE}
+
+cd /work/marinegenomics/dswift/Workspace/scalloped_hh/haplotype/
+
+scp dswift@10.5.146.54:/home/dswift/projects/hammerheads/nurseries/data/haplotype/slew_pre_hap.recode.vcf .
+
+scp dswift@10.5.146.54:/home/dswift/projects/hammerheads/nurseries/data/haplotype/popmap .
+
+```
+
+Haplotype by running: `sbatch ~/bin/slurm/slew_nurseries_rad_haplotyper.slurm`
+
+```{bash}
+
+#!/bin/bash
+#SBATCH -J rad_hap          # Name of the job
+#SBATCH -o rad_hap.out       # Name of file that will have program output
+#SBATCH -e rad_hap.err       # Name of the file that will have job errors, if any
+#SBATCH -N 1                    # Number of nodes ( the normal cluster partion has 22 total )
+#SBATCH -n 64                   # Number of cores ( my test allocated 2 per node
+#SBATCH -p normal
+#SBATCH --mail-user=dominic.swift@tamucc.edu
+#SBATCH --mail-type=begin       # email me when the job starts
+#SBATCH --mail-type=end         # email me when the job ends
+#SBATCH --time=96:00:00
+
+source /home/dswift/.bashrc
+
+conda activate rad_hap
+
+# reorder reference.fasta.fai file
+
+#sort -k1,1 -o reference.fasta.fai reference.fasta.fai
+
+rad_haplotyper.pl -v slew_pre_hap.recode.vcf -r reference.fasta -o slew_nurseries_hap.vcf -g slew_nurseries.gen -p popmap -x 64 -m 0.90
+
+```
+
+# Post-haplotype Analysis
+
+Copy files over to `earth`.
+
+```{bash}
+
+cd /home/dswift/projects/hammerheads/nurseries/data/haplotype
+
+scp dswift@crest-login.tamucc.edu:/work/marinegenomics/dswift/Workspace/scalloped_hh/haplotype/hap_loci.txt .
+
+scp dswift@crest-login.tamucc.edu:/work/marinegenomics/dswift/Workspace/scalloped_hh/haplotype/codes.slew_nurseries.gen .
+
+scp dswift@crest-login.tamucc.edu:/work/marinegenomics/dswift/Workspace/scalloped_hh/haplotype/ind_stats.out .
+
+scp dswift@crest-login.tamucc.edu:/work/marinegenomics/dswift/Workspace/scalloped_hh/haplotype/slew_nurseries.gen .
+
+scp dswift@crest-login.tamucc.edu:/work/marinegenomics/dswift/Workspace/scalloped_hh/haplotype/slew_nurseries_hap.vcf .
+
+scp dswift@crest-login.tamucc.edu:/work/marinegenomics/dswift/Workspace/scalloped_hh/haplotype/stats.out .
+
+```
+
+Compare the number of loci filtered due to excess missing data or suspected paralogs to those that passed.
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# import sample data
+
+slew_sample_data <- read_csv(here("data", "filter", "slew_nurseries_sample_data.csv"))
+
+# Import stats files generated by haplotyper
+
+hap_stats <- read_delim(here("data", "haplotype", "stats.out"), skip = 1, delim = "\t") %>% 
+  rename(Low_Cov_Geno_Err = "Low_Cov/Geno_Err") %>% 
+  rename(CHR = Locus) %>% 
+  mutate_at("Prop_Haplotyped", as.numeric) %>% 
+  mutate_at(c("Sites", "Haplotypes", "Inds_Haplotyped", "Total_Inds", "Poss_Paralog", "Low_Cov_Geno_Err", "Miss_Geno"), as.integer)
+
+# View comparison of filtered vs. passed loci
+
+ggplot(hap_stats, aes(x = Status, stat = "identity")) +
+  geom_bar(color = "black", fill = "grey") +
+  labs(x = "Filter Status", y = "Number of Loci") +
+  theme_standard
+
+# ind stats
+
+ind_hap_stats <- read_delim(here("data", "haplotype", "ind_stats.out"), delim = "\t") %>%
+  rename("seq_id" = Ind) %>%
+  left_join(., slew_sample_data) %>% 
+  rename(Low_Coverage_Errors = "Low_Coverage/Errors")
+
+# Remove inds that failed
+
+ind_hap_filt <- filter(ind_hap_stats, Prop_Success < 0.89) %>% 
+  write_delim(., here("data", "filter", "hap_fail.ind"))
+
+```
+
+Remove filtered loci from data set
+
+```{r}
+
+count(hap_stats, Status == "FILTERED")
+
+filt_hap_stats <- hap_stats %>%
+    filter(Status == "PASSED") %>%
+    select(-Comment, -Status)
+
+```
+
+`r nrow(filt_hap_stats)` loci passed haplotyping.
+
+```{r fig.height=6, fig.width=9, message=FALSE, warning=FALSE}
+
+tidy_loci <- filt_hap_stats %>%
+  select(-Total_Inds, -Inds_Haplotyped) %>%
+  gather("STAT", "LOCI", 2:7)
+  
+# plots
+
+ggplot(tidy_loci, aes(x = LOCI, stat = "bin")) +
+  geom_histogram(color = "black", fill = "grey") +
+  facet_wrap(~STAT, scales = "free") +
+  labs(x = "") +
+  theme_classic()
+
+```
+
+Data set contains `r nrow(ind_hap_stats)` individuals
+
+```{r fig.height=6, fig.width=6, message=FALSE, warning=FALSE}
+
+tidy_ind <- ind_hap_stats %>%
+  select(-Total_Loci, -Total_Failed) %>%
+  gather("STAT", "LOCI", 2:5)
+  
+# plots
+
+ggplot(tidy_ind, aes(x = LOCI, stat = "bin")) +
+  geom_histogram(color = "black", fill = "grey") +
+  facet_wrap(~STAT, scales = "free") +
+  labs(x = "stat") +
+  theme_classic()
+  
+```
+
+Identify threshold values to filter data set: proportion of loci haplotyped
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(filt_hap_stats, aes(x = Prop_Haplotyped)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = mean(Prop_Haplotyped, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.8), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Proportion of Loci Haplotyped") +
+  theme_standard
+
+```
+
+Flag loci successfully haplotyped in <90% of individuals.
+
+```{r message=FALSE, warning=FALSE}
+
+# Number of loci called in >80% individuals
+
+count(filt_hap_stats, Prop_Haplotyped < 0.9)
+
+# Create vector of loci to remove (choose cut-off)
+
+prop_haplotyped <- hap_stats %>%
+    filter(Prop_Haplotyped < 0.9)
+
+prop_haplotyped <- prop_haplotyped$CHR
+
+```
+
+`r length(prop_haplotyped)` loci were flagged as genotype call rate <0.95.
+
+Loci are flagged as possible paralogs for an individual when more than the expected number of haplotypes based on the SNP genotype call (homozygote, heterozygote) are detected
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(filt_hap_stats, aes(x = Poss_Paralog)) +
+  geom_histogram(binwidth = 2, color = "black", fill = "grey") +
+  labs(x = "Putative Paralogs per Locus") +
+  theme_standard
+
+nrow(ind_hap_stats)*0.01
+
+```
+
+Flag loci that are potential paralogs in > 1% of total number of individuals
+
+```{r}
+
+# Number of loci with Poss_Paralogs
+
+count(filt_hap_stats, Poss_Paralog > nrow(ind_hap_stats)*0.01)
+
+# Create vector of loci to remove (choose cut-off)
+
+poss_paralog <- filt_hap_stats %>%
+  filter(Poss_Paralog > nrow(ind_hap_stats)*0.01)
+
+poss_paralog <- poss_paralog$CHR
+
+```
+
+`r length(Poss_Paralogs)` loci were flagged as possible paralogs
+
+Each locus varies in the number of SNPs detected which determines the number of haplotypes expected in that population.
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(filt_hap_stats, aes(x = Sites)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+  labs(x = "Number of SNPs per Contig") +
+  theme_standard
+
+```
+
+Filter loci based on number of SNPs contained on that locus could bias the data set as loci with high recombination may be removed.
+
+On the other hand, assuming an approximate length of 250 bp loci with more than `r 250*0.1` SNPs would mean that 10% of bases are polymorphisms.
+
+Notice that with higher number of SNP sites, loci also more probable to have been flagged as possible paralogs in multiple individuals.
+
+```{r}
+
+count(filt_hap_stats, Sites > 25)
+
+excess_SNPs <- filt_hap_stats %>%
+    filter(Sites > 25)
+  
+excess_SNPs <- excess_SNPs$CHR
+
+```
+
+Assuming that mutation is the only mechanism resulting in new haplotypes, the maximum expected number of haplotypes per locus is number of SNPs + 1. 
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(filt_hap_stats, aes(x = Haplotypes)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = mean(Haplotypes, na.rm = TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = quantile(Haplotypes, .99)), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Haplotypes per Locus", y = "Loci") +
+  theme_standard
+
+temp <- filt_hap_stats %>%
+  select(CHR, Sites, Haplotypes, Prop_Haplotyped, Low_Cov_Geno_Err, Poss_Paralog) %>%
+  mutate(exp_sites = Sites + 1) %>%
+  mutate(xtra = Haplotypes - Sites)
+
+ggplot(temp, aes(x = Sites, y = Poss_Paralog)) +
+  geom_point() +
+  geom_hline(yintercept = 5, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 15, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "SNPs per Locus", y = "Possible Paralogs") +
+  theme_standard
+
+ggplot(temp, aes(x = Sites, y = xtra)) +
+  geom_point() +
+  geom_hline(yintercept = 10, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 15, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "SNPs per Locus", y = "Extra Haplotypes") +
+  theme_standard
+
+ggplot(temp, aes(x = xtra, y = Prop_Haplotyped)) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = 0.9, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 10, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Extra Haplotypes", y = "Proportion of Individuals Haplotyped") +
+  theme_standard
+
+ggplot(temp, aes(x = xtra, y = Low_Cov_Geno_Err)) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = 9, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 10, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Extra Haplotypes", y = "Putative Genotyping Error") +
+  theme_standard
+
+ggplot(temp, aes(x = xtra, y = Poss_Paralog)) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = 9, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 10, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Extra Haplotypes", y = "Putative Paralogs") +
+  theme_standard
+
+```
+
+Again, removing loci with unexpectedly high numbers of haplotypes may bias the data set, as loci with e.g. high recombination may be removed from the data set
+
+```{r}
+
+count(temp, xtra >= 10)
+
+# Create vector of loci to remove
+
+hap_n <- filter(temp, xtra >= 10)
+
+hap_n <- hap_n$CHR
+
+```
+
+`r length(hap_n)` loci were flagged for excessive number of haplotypes compared to the number of SNPs at that locus
+
+After combining SNPs on the same contig during the haplotyping process, it is possible to observe fewer than the expected number of haplotypes based on the genotype call (heterozygote/homozygote)
+
+When this occurs, that genotype is coded as missing. For each locus the number of individuals for which is it flagged as a potential genotyping error or suffering from null alleles due to low coverage detected for a given locus is recorded.
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(filt_hap_stats, aes(x = Low_Cov_Geno_Err)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = (nrow(ind_hap_stats)*0.01)), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Putative Genotyping Error") +
+  theme_standard
+
+```
+
+Cut-off value to remove locus if flagged as potential genotyping error in 5 or more individuals
+
+```{r message=FALSE, warning=FALSE}
+
+# Summary of count of possible genotyping errors
+
+count(filt_hap_stats, Low_Cov_Geno_Err > 5)
+
+# Create vector of loci to remove
+
+genoerror <- filt_hap_stats %>%
+    filter(Low_Cov_Geno_Err > 5)
+
+genoerror <- genoerror$CHR
+
+```
+
+`r length(genoerror)` loci were flagged as potentially affected by genotyping error
+
+Loci that are not successfully haplotyped in an individual due to missing data, complex locus, haplotyped genotype is higher/lower than SNP haplotype in a given individual are coded as missing for that individual
+
+Problematic individual can be identified as having an increased amount of missing data and a low proportion of successfully haplotyped loci
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(ind_hap_stats, aes(x = Prop_Success)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 0.9), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Samples Successfully Haplotyped") +
+  theme_standard
+
+```
+
+Problem individuals can be identified by choosing a cut-off value for the minimum proportion of sucessfully haplotyped loci and excluding individuals below that threshold value
+
+```{r}
+
+# Count individuals above set threshold
+
+count(ind_hap_stats, Prop_Success < 0.89)
+
+# Create vector of indv to remove (choose cut-off)
+
+ind_fail <- filter(ind_hap_stats, Prop_Success < 0.89)
+
+```
+
+Individuals with high proportion of loci flagged as possible paralogs should be flagged as potential problem individuals
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(ind_hap_stats, aes(x = Poss_Paralogs)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 10), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Putative Paralogs") +
+  theme_standard
+
+```
+
+Cut-off for individuals with loci flagged paralogs in > 10% of loci is `r nrow(filt_hap_stats)*0.05`
+
+```{r}
+
+# Count individuals above set threshold
+
+count(ind_hap_stats, Poss_Paralogs > (nrow(filt_hap_stats)*0.05))
+
+# Create vector of indv to remove (choose cut-off)
+
+ind_paralog <- ind_hap_stats %>%
+  filter(Poss_Paralogs > (nrow(filt_hap_stats)*0.05))
+
+ind_paralog <- ind_paralog$seq_id
+
+```
+
+The highest number of flagged loci in an individuals is `r max(ind_hap_stats$Poss_Paralogs, na.rm = TRUE)`, which is equivalent to `r round(max(ind_hap_stats$Poss_Paralogs, na.rm = TRUE)/nrow(filt_hap_stats), digits = 4)*100`% of loci
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(ind_hap_stats, aes(x = Low_Coverage_Errors)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept = 10), color = "red", linetype = "dashed", size = 1) +
+  labs(x = "Putative Genotyping Errors", y = "Individuals") +
+  theme_standard
+
+```
+
+Remove individuals with high proportion of loci that have been flagged as potential allele dropouts/genotyping error.
+
+```{r}
+
+# Count individuals above set threshold
+
+count(ind_hap_stats, Low_Coverage_Errors > nrow(hap_stats)*0.05)
+
+# Create vector of indv to remove (choose cut-off)
+
+ind_geno <- ind_hap_stats %>%
+  filter(Low_Coverage_Errors > nrow(hap_stats)*0.05)
+
+ind_geno <- ind_geno$seq_id
+
+```
+
+The highest number of flagged loci in an individuals is `r max(ind_hap_stats$Low_Coverage.Errors, na.rm = TRUE)`, which is equivalent to `r round(max(ind_hap_stats$Low_Coverage.Errors, na.rm = TRUE)/nrow(filt_hap_stats), digits = 4)*100`% of loci
+
+Produce list of loci and samples to remove.
+
+```{r}
+
+# Write list of removed loci to file
+
+remove_loci <- c(prop_haplotyped, poss_paralog, excess_SNPs, hap_n, genoerror) %>% 
+  as_tibble_col("LOCUS") %>%
+  write_delim(., here("data", "filter", "hap_fail.loci"), col_names = F)
+
+# Write list of removed inds to file
+
+remove_ind <- rbind(ind_fail, ind_paralog, ind_geno) %>% 
+  select(seq_id) %>% 
+  write_delim(., here("data", "filter", "hap_fail.ind"), col_names = F)
+
+```
+
+## Read in Genepop
+  
+Load haplotyped genepop file and remove loci and samples that didn't pass.
+
+```{r message=FALSE, warning=FALSE}
+
+# import genepop file
+
+slew.gen <- read.genepop(file = here("data", "haplotype", "slew_nurseries.gen"), ncode = 3L, quiet = FALSE)
+
+slew.gen
+
+slew_inds <- tibble(indNames(slew.gen)) %>%
+  rename(seq_id = `indNames(slew.gen)`)
+
+# remove loci and samples that failed haplotyping
+
+remove_loci <- read_delim(here("data", "filter", "hap_fail.loci"), delim = "\t", col_names = "LOCUS")
+
+remove_ind <- read_delim(here("data", "filter" , "hap_fail.ind"), delim = "\t", col_names = "seq_id")
+
+# produce list of SNPs to retain for Outflank
+
+keep_snps <- read_delim(here("data", "haplotype", "hap_loci.txt"), delim = "\t", col_names = c("contig", "pos")) %>% 
+  filter(!contig %in% remove_loci$LOCUS) %>% 
+  write_delim(., here("data", "filter", "hap_success.snp"), col_names = F)
+
+# remove loci and inds from genepop
+
+slew_filt.gen <- genind.rem.loci(slew.gen, remove_loci$LOCUS)
+
+slew_filt.gen <- gen.ind.rem.Ind(slew_filt.gen, remove_ind$seq_id)
+
+slew_filt.gen
+
+# produce strata
+
+slew_sample_data <- read_csv(here("data", "filter", "slew_nurseries_sample_data.csv"))
+
+slew_filt_inds <- tibble(indNames(slew_filt.gen)) %>%
+  rename(seq_id = `indNames(slew_filt.gen)`)
+
+slew_strata <- left_join(slew_filt_inds, slew_sample_data) %>% 
+  mutate(date = make_date(year, month, day), .before = "day") %>% 
+  write_csv(., here("data", "filter", "slew_nurseries_strata.csv"))
+
+# loci stats
+
+all_loci <- locNames(slew_filt.gen) %>% 
+  as_tibble_col("Locus") %>% 
+  left_join(read_delim(here("data", "haplotype", "stats.out"), skip = 1, delim = "\t"))
+
+```
+
+## Assess Heterozygosity
+
+Generate summary statistics
+
+```{r, message=FALSE, warning=FALSE}
+
+# assign strata
+
+strata(slew_filt.gen) <- slew_strata %>% 
+  mutate(pop = "pop")
+
+setPop(slew_filt.gen) <- ~nursery
+
+# Generate genetic diversity stats
+
+gendiv <- summary(slew_filt.gen)
+
+dat <- genind2hierfstat(slew_filt.gen)
+gendiv2 <- basic.stats(dat)
+
+```
+
+Compare observed and expected heterozygosity for all individuals across all nurseries.
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# Observed heterozygosity per locus
+
+obs_het <- as.data.frame(gendiv$Hobs) %>% 
+  rownames_to_column("LOCUS") %>%
+  rename(obs_het = `gendiv$Hobs`)
+
+# Expected heterozygosity per locus
+
+exp_het <- as.data.frame(gendiv$Hexp) %>% 
+  rownames_to_column("LOCUS") %>%
+  rename(exp_het = `gendiv$Hexp`)
+
+# Expected and observed heterozysity per locus
+
+obs_exp_het <- left_join(obs_het, exp_het, by = "LOCUS") %>% 
+  mutate(obs_exp_het = obs_het/exp_het)
+
+# Plot Ho vs Hs across all individuals
+
+ggplot(obs_exp_het, aes(x = obs_het, y = exp_het)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  labs(x = "Observed Heterozygosity (Ho)", y = "Expected Heterozygosity (Hexp)") +
+  ggtitle("") +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# remove monomorphic loci
+
+remove_monomorphic <- filter(obs_exp_het, obs_het == 0) %>%
+  distinct(LOCUS)
+
+slew_filt.gen <- genind.rem.loci(slew_filt.gen, remove_monomorphic$LOCUS)
+
+```
+
+## Library Effects
+
+```{r fig.height=6, fig.width=6, message=FALSE, warning=FALSE}
+
+# PCA
+
+X <- tab(slew_filt.gen, freq=TRUE, NA.method="mean")
+
+PCA <- dudi.pca(df = X, center = TRUE, scale = FALSE, scannf = FALSE, nf = 10)
+
+eig <- eigenvalues(PCA)
+
+# Plot
+
+pc_inds  <- PC.ind(PCA) %>%
+  left_join(., slew_strata)
+
+# Plot by library and region
+
+ggplot(pc_inds , aes(x = Axis1, y = Axis2, label = nursery, fill = nursery, color = nursery)) +
+  geom_point(alpha = 0.75, size = 4) +
+  labs(x = paste("PC1:", round(eig[1, 3], digits = 3)), 
+       y = paste("PC2:", round(eig[2, 3], digits = 3))) +
+  ggtitle("By Nursery") +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  guides(fill=guide_legend(nrow=2, byrow=TRUE))
+
+
+ggplot(pc_inds , aes(x = Axis1, y = Axis2, label = library, fill = library, color = library)) +
+  geom_point(alpha = 0.75, size = 4) +
+  labs(x = paste("PC1:", round(eig[1, 3], digits = 3)), 
+       y = paste("PC2:", round(eig[2, 3], digits = 3))) +
+  ggtitle("By Library") +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  guides(fill=guide_legend(nrow=2, byrow=TRUE))
+
+```
+
+## Export Dataset
+
+Export filtered genepop and strata for relatedness analysis.
+
+```{r}
+
+setPop(slew_filt.gen) <- ~nursery
+
+nursery_order <- c("BB", "TR", "CB", "FPH", "CCB")
+
+slew_filt.gen$pop <- factor(slew_filt.gen$pop, levels=nursery_order)
+
+writeGenPop(slew_filt.gen, file.name = here("data", "filter", "slew_nurseries_filt.gen"), comment = "slew_nurseries_filt.gen")
+
+```
+
+**Filtered genepop has 472 individuals genotyped at 8,334 SNP-containing loci.**

@@ -1,0 +1,223 @@
+---
+title: "United States Scalloped Hammerhead Nurseries, Effective Size"
+output: 
+  html_document: 
+    toc: yes
+  html_notebook: 
+    highlight: kate
+    theme: flatly
+    toc: yes
+---
+
+Produce estimates of effective population size and number of breeders per cohort, including randomly sampled kin.
+
+# Environment
+  
+```{r, message=FALSE}
+
+.libPaths("/usr/lib64/R/library")
+
+# invalidate cache when the package version changes
+
+knitr::opts_chunk$set(
+  root.dir = "~/projects/international",
+	message = FALSE,
+	warning = FALSE,
+  cache.extra = packageVersion("tint"),
+	tidy = FALSE,
+	echo = FALSE)
+
+options(htmltools.dir.version = FALSE)
+
+# conflicts
+
+library(conflicted)
+conflict_prefer("count", "dplyr")
+conflict_prefer("arrange", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("summarise", "dplyr")
+conflict_prefer("summarize", "dplyr")
+conflict_prefer("s.label", "adegraphics")
+conflict_prefer("s.value", "adegraphics")
+conflict_prefer("scalebar", "raster")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("extract", "raster")
+conflict_prefer("degree", "igraph")
+
+# packages
+
+library(tidyverse)
+library(adegenet)
+library(here)
+library(readr)
+library(glue)
+library(knitr)
+library(poppr)
+library(hierfstat)
+library(coin)
+library(zvau)
+library(gdata)
+library(readxl)
+
+# source scripts
+
+source("~/bin/ggplot.R")
+source("~/bin/genind.R")
+source("~/bin/PCA.R")
+source("~/bin/DAPC.R")
+source("~/bin/vegan.R")
+source("~/bin/ordiR2step.R")
+
+# orders, colors, shapes
+
+nursery_order <- c("BB", "TR", "CB", "FPH", "CCB")
+
+nursery_order_full <- c("Bulls Bay", "Tolomator River", "Cape Canaveral", "Florida Panhandle", "Corpus Christi Bay")
+
+nursery_map <- rlang::set_names(nursery_order_full, nursery_order)
+
+nursery_colors <- c('#a50026', '#f46d43', '#fee090', '#74add1', '#313695')
+
+```
+
+# Import Data
+
+Import `slew_nurseries_filt.gen` and remove FST outliers.
+
+```{r, message=FALSE}
+
+slew.gen <- read.genepop(file = here("data", "filter", "slew_nurseries_filt.gen"), ncode = 3L, quiet = FALSE)
+
+slew_strata <- read_csv(here("data", "filter", "slew_nurseries_strata.csv")) %>% 
+  mutate(
+    Nursery = dplyr::recode(nursery, !!!nursery_map),
+    Nursery = factor(Nursery, levels = nursery_order_full)
+  )
+
+# remove non-randomly sampled sibs
+
+remove_non_random_sibs <- read_csv(here("data", "related", "slew_nurseries_sibs_mt_haps.csv")) %>% 
+  filter(days_diff == 0)
+
+slew_no_non_random_sibs.gen <- gen.ind.rem.Ind(slew.gen, remove_non_random_sibs$seq_id1)
+
+# remove loci with missing data
+
+slew_no_miss.gen <- missingno(slew_no_non_random_sibs.gen, type = "loci", cutoff = 0)
+
+# assign strata and grouping
+
+slew_strata <- indNames(slew_no_miss.gen) %>% 
+  as_tibble_col("seq_id") %>% 
+  left_join(., slew_strata)
+
+strata(slew_no_miss.gen) <- slew_strata
+                        
+setPop(slew_no_miss.gen) <- ~nursery
+
+```
+
+# Remove Monomorphic Loci
+
+Find monomorphic loci in across all nurseries.
+
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+# generate genetic diversity stats for all
+
+gendiv_all <- adegenet::summary(slew_no_miss.gen)
+
+# observed heterozygosity per locus
+
+obs_het <- as.data.frame(gendiv_all$Hobs) %>% 
+  rownames_to_column("locus") %>%
+  rename(obs_het = `gendiv_all$Hobs`)
+
+# expected heterozygosity per locus
+
+exp_het <- as.data.frame(gendiv_all$Hexp) %>% 
+  rownames_to_column("locus") %>%
+  rename(exp_het = `gendiv_all$Hexp`)
+
+# combine
+
+obs_exp_het <- left_join(obs_het, exp_het, by = "locus")
+
+# plot
+
+ggplot(obs_exp_het, aes(x = obs_het, y = exp_het)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  labs(x = "Observed Heterozygosity", y = "Expected Heterozygosity") +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# id monomorphic loci
+
+monomorphic_all <- filter(obs_exp_het, obs_het == 0) %>%
+  select(locus)
+
+```
+
+Find monomorphic loci in each nursery and remove so that estimates of effective size are based on the same set of loci for each nursery.
+
+```{r fig.height=5, fig.width=15, message=FALSE, warning=FALSE}
+
+# generate genetic diversity stats for all
+
+fstats <- genind2hierfstat(slew_no_miss.gen)
+
+gendiv_nursery <- basic.stats(fstats)
+
+# observed heterozygosity per locus per nursery
+
+obs_het_nursery <- as.data.frame(gendiv_nursery$Ho) %>% 
+  rownames_to_column("locus") %>% 
+  pivot_longer(cols = 2:ncol(.), names_to = "nursery", values_to = "obs_het")
+
+# expected heterozygosity per locus
+
+exp_het_nursery <- as.data.frame(gendiv_nursery$Hs) %>% 
+  rownames_to_column("locus") %>% 
+  pivot_longer(cols = 2:ncol(.), names_to = "nursery", values_to = "exp_het")
+
+# combine
+
+obs_exp_het_nursery <- left_join(obs_het_nursery, exp_het_nursery, by = c("locus", "nursery")) %>% 
+  mutate(nursery = ordered(nursery, levels = nursery_order))
+
+# plot
+
+ggplot(obs_exp_het_nursery, aes(x = obs_het, y = exp_het)) +
+  geom_point(size = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 0.5) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  labs(x = "Observed Heterozygosity", y = "Expected Heterozygosity") +
+  facet_grid(. ~ nursery) +
+  theme_standard + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# id monomorphic loci in any nursery
+
+monomorphic_any <- filter(obs_exp_het_nursery, obs_het == 0) %>%
+  distinct(locus)
+
+```
+
+Export genepop with no missing data nor loci that are monomorphic in any nursery.
+
+```{r}
+
+slew_no_miss_mono.gen <- genind.rem.loci(slew_no_miss.gen, monomorphic_any$locus)
+
+slew_no_miss_mono.gen$pop <- factor(slew_no_miss_mono.gen$pop, levels=nursery_order)
+
+writeGenPop(slew_no_miss_mono.gen, file.name = here("data", "ne", "slew_no_miss_mono.gen"), comment = "slew_no_miss_mono.gen")
+
+```
